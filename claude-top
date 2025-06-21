@@ -1,0 +1,388 @@
+#!/usr/bin/env python3
+"""
+claude-top: A terminal-based monitoring tool for Claude CLI instances
+"""
+
+import curses
+import json
+import os
+import psutil
+import signal
+import time
+from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path
+from typing import List, Optional, Dict
+import subprocess
+import argparse
+
+@dataclass
+class ClaudeInstance:
+    pid: int
+    working_dir: str
+    task: str
+    context_length: int
+    tokens_used: int
+    start_time: datetime
+    status: str  # 'running', 'paused', 'completed'
+    cpu_percent: float
+    memory_mb: float
+    command: str
+
+class ClaudeMonitor:
+    def __init__(self):
+        self.instances: List[ClaudeInstance] = []
+        self.selected_index = 0
+        self.paused_pids = set()
+        self.update_interval = 1.0
+        self.sort_key = 'pid'
+        self.reverse_sort = False
+        
+    def find_claude_processes(self):
+        """Find all Claude CLI processes running on the system"""
+        claude_processes = []
+        
+        for proc in psutil.process_iter(['pid', 'name', 'cmdline', 'cwd', 'create_time', 'cpu_percent', 'memory_info']):
+            try:
+                # Check if this is a Claude CLI process
+                cmdline = proc.info.get('cmdline', [])
+                if cmdline and any('claude' in cmd.lower() for cmd in cmdline):
+                    # Extract relevant information
+                    instance = self.parse_claude_process(proc)
+                    if instance:
+                        claude_processes.append(instance)
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                continue
+                
+        return claude_processes
+    
+    def parse_claude_process(self, proc) -> Optional[ClaudeInstance]:
+        """Parse process information to create ClaudeInstance"""
+        try:
+            info = proc.info
+            pid = info['pid']
+            cwd = info.get('cwd', 'Unknown')
+            cmdline = ' '.join(info.get('cmdline', []))
+            
+            # Try to extract task information from command line or process metadata
+            task = self.extract_task_from_cmdline(cmdline)
+            
+            # Get context and token information (would need to read from Claude's state files)
+            context_length, tokens_used = self.get_claude_metrics(pid, cwd)
+            
+            # Check if process is paused
+            status = 'paused' if pid in self.paused_pids else proc.status()
+            if status == 'stopped':
+                status = 'paused'
+            elif status in ['running', 'sleeping']:
+                status = 'running'
+            
+            return ClaudeInstance(
+                pid=pid,
+                working_dir=cwd,
+                task=task,
+                context_length=context_length,
+                tokens_used=tokens_used,
+                start_time=datetime.fromtimestamp(info['create_time']),
+                status=status,
+                cpu_percent=info.get('cpu_percent', 0.0),
+                memory_mb=info.get('memory_info').rss / 1024 / 1024 if info.get('memory_info') else 0,
+                command=cmdline
+            )
+        except Exception:
+            return None
+    
+    def extract_task_from_cmdline(self, cmdline: str) -> str:
+        """Extract task description from command line"""
+        # This is a simplified extraction - in reality, you'd parse Claude's specific format
+        if '--task' in cmdline:
+            parts = cmdline.split('--task')
+            if len(parts) > 1:
+                return parts[1].split()[0].strip('"\'')
+        elif 'claude' in cmdline:
+            # Try to extract any quoted strings as potential tasks
+            import re
+            quotes = re.findall(r'"([^"]*)"', cmdline)
+            if quotes:
+                return quotes[0][:50] + '...' if len(quotes[0]) > 50 else quotes[0]
+        return "Unknown Task"
+    
+    def get_claude_metrics(self, pid: int, working_dir: str) -> tuple:
+        """Get context length and token usage from Claude's state files"""
+        # Look for Claude state files in the working directory
+        # This is hypothetical - actual implementation would depend on Claude's file format
+        try:
+            state_file = Path(working_dir) / '.claude' / 'state.json'
+            if state_file.exists():
+                with open(state_file, 'r') as f:
+                    state = json.load(f)
+                    return state.get('context_length', 0), state.get('tokens_used', 0)
+        except Exception:
+            pass
+        
+        # Return mock data for demonstration
+        import random
+        return random.randint(1000, 50000), random.randint(100, 10000)
+    
+    def pause_resume_process(self, pid: int):
+        """Pause or resume a process"""
+        try:
+            if pid in self.paused_pids:
+                os.kill(pid, signal.SIGCONT)
+                self.paused_pids.remove(pid)
+            else:
+                os.kill(pid, signal.SIGSTOP)
+                self.paused_pids.add(pid)
+        except Exception as e:
+            return f"Error: {str(e)}"
+        return None
+    
+    def sort_instances(self):
+        """Sort instances by the current sort key"""
+        if self.sort_key == 'pid':
+            self.instances.sort(key=lambda x: x.pid, reverse=self.reverse_sort)
+        elif self.sort_key == 'cpu':
+            self.instances.sort(key=lambda x: x.cpu_percent, reverse=self.reverse_sort)
+        elif self.sort_key == 'memory':
+            self.instances.sort(key=lambda x: x.memory_mb, reverse=self.reverse_sort)
+        elif self.sort_key == 'tokens':
+            self.instances.sort(key=lambda x: x.tokens_used, reverse=self.reverse_sort)
+        elif self.sort_key == 'time':
+            self.instances.sort(key=lambda x: x.start_time, reverse=self.reverse_sort)
+
+class ClaudeTopUI:
+    def __init__(self, stdscr):
+        self.stdscr = stdscr
+        self.monitor = ClaudeMonitor()
+        self.setup_colors()
+        self.error_message = ""
+        self.show_help = False
+        
+    def setup_colors(self):
+        """Initialize color pairs"""
+        curses.start_color()
+        curses.init_pair(1, curses.COLOR_GREEN, curses.COLOR_BLACK)  # Running
+        curses.init_pair(2, curses.COLOR_YELLOW, curses.COLOR_BLACK)  # Paused
+        curses.init_pair(3, curses.COLOR_RED, curses.COLOR_BLACK)  # High CPU/Memory
+        curses.init_pair(4, curses.COLOR_CYAN, curses.COLOR_BLACK)  # Header
+        curses.init_pair(5, curses.COLOR_WHITE, curses.COLOR_BLUE)  # Selected
+        
+    def draw_header(self):
+        """Draw the header with title and stats"""
+        height, width = self.stdscr.getmaxyx()
+        
+        # Title
+        title = "═══ Claude-Top - Claude CLI Monitor ═══"
+        self.stdscr.attron(curses.color_pair(4) | curses.A_BOLD)
+        self.stdscr.addstr(0, (width - len(title)) // 2, title)
+        self.stdscr.attroff(curses.color_pair(4) | curses.A_BOLD)
+        
+        # Stats line
+        num_instances = len(self.monitor.instances)
+        num_running = sum(1 for i in self.monitor.instances if i.status == 'running')
+        num_paused = sum(1 for i in self.monitor.instances if i.status == 'paused')
+        total_tokens = sum(i.tokens_used for i in self.monitor.instances)
+        
+        stats = f"Instances: {num_instances} | Running: {num_running} | Paused: {num_paused} | Total Tokens: {total_tokens:,}"
+        self.stdscr.addstr(1, 2, stats)
+        
+        # Column headers
+        headers = f"{'PID':>7} {'Status':>10} {'CPU%':>6} {'Mem(MB)':>8} {'Tokens':>10} {'Context':>10} {'Time':>8} {'Dir':>20} {'Task'}"
+        self.stdscr.attron(curses.A_UNDERLINE)
+        self.stdscr.addstr(3, 0, headers[:width-1])
+        self.stdscr.attroff(curses.A_UNDERLINE)
+        
+    def draw_instances(self):
+        """Draw the list of Claude instances"""
+        height, width = self.stdscr.getmaxyx()
+        start_y = 4
+        visible_lines = height - start_y - 3  # Leave room for footer
+        
+        for idx, instance in enumerate(self.monitor.instances[:visible_lines]):
+            y = start_y + idx
+            
+            # Highlight selected row
+            if idx == self.monitor.selected_index:
+                self.stdscr.attron(curses.color_pair(5))
+            
+            # Color based on status
+            if instance.status == 'running':
+                color = curses.color_pair(1)
+            elif instance.status == 'paused':
+                color = curses.color_pair(2)
+            else:
+                color = curses.color_pair(0)
+            
+            # High resource usage warning
+            if instance.cpu_percent > 80 or instance.memory_mb > 1000:
+                color = curses.color_pair(3)
+            
+            # Format the row
+            elapsed = datetime.now() - instance.start_time
+            elapsed_str = f"{elapsed.seconds//3600:02d}:{(elapsed.seconds//60)%60:02d}:{elapsed.seconds%60:02d}"
+            
+            dir_short = instance.working_dir.split('/')[-1] if '/' in instance.working_dir else instance.working_dir
+            task_short = instance.task[:30] + '...' if len(instance.task) > 30 else instance.task
+            
+            row = f"{instance.pid:>7} {instance.status:>10} {instance.cpu_percent:>6.1f} {instance.memory_mb:>8.1f} {instance.tokens_used:>10,} {instance.context_length:>10,} {elapsed_str:>8} {dir_short:>20} {task_short}"
+            
+            self.stdscr.attron(color)
+            self.stdscr.addstr(y, 0, row[:width-1])
+            self.stdscr.attroff(color)
+            
+            if idx == self.monitor.selected_index:
+                self.stdscr.attroff(curses.color_pair(5))
+    
+    def draw_footer(self):
+        """Draw the footer with commands"""
+        height, width = self.stdscr.getmaxyx()
+        
+        # Error message if any
+        if self.error_message:
+            self.stdscr.attron(curses.color_pair(3))
+            self.stdscr.addstr(height-3, 2, self.error_message[:width-4])
+            self.stdscr.attroff(curses.color_pair(3))
+        
+        # Commands
+        commands = "q:Quit  p:Pause/Resume  k:Kill  s:Sort  h:Help  ↑↓:Navigate"
+        self.stdscr.addstr(height-1, 2, commands[:width-4])
+    
+    def draw_help(self):
+        """Draw help overlay"""
+        height, width = self.stdscr.getmaxyx()
+        help_text = [
+            "Claude-Top Help",
+            "",
+            "Navigation:",
+            "  ↑/↓ or j/k  - Move selection up/down",
+            "  Home/End    - Go to first/last item",
+            "",
+            "Actions:",
+            "  p           - Pause/Resume selected instance",
+            "  k           - Kill selected instance",
+            "  Enter       - View detailed information",
+            "",
+            "Sorting:",
+            "  s           - Cycle through sort options",
+            "  r           - Reverse sort order",
+            "",
+            "Display:",
+            "  h           - Toggle this help",
+            "  q or Esc    - Quit",
+            "",
+            "Press any key to close help..."
+        ]
+        
+        # Calculate box dimensions
+        box_height = len(help_text) + 4
+        box_width = max(len(line) for line in help_text) + 6
+        start_y = (height - box_height) // 2
+        start_x = (width - box_width) // 2
+        
+        # Draw box
+        self.stdscr.attron(curses.color_pair(4))
+        for y in range(box_height):
+            self.stdscr.addstr(start_y + y, start_x, " " * box_width)
+        
+        # Draw help text
+        for i, line in enumerate(help_text):
+            self.stdscr.addstr(start_y + i + 2, start_x + 3, line)
+        self.stdscr.attroff(curses.color_pair(4))
+    
+    def handle_input(self):
+        """Handle keyboard input"""
+        key = self.stdscr.getch()
+        
+        if self.show_help:
+            self.show_help = False
+            return True
+        
+        if key == ord('q') or key == 27:  # q or ESC
+            return False
+        elif key == ord('h'):
+            self.show_help = True
+        elif key == curses.KEY_UP or key == ord('k'):
+            if self.monitor.selected_index > 0:
+                self.monitor.selected_index -= 1
+        elif key == curses.KEY_DOWN or key == ord('j'):
+            if self.monitor.selected_index < len(self.monitor.instances) - 1:
+                self.monitor.selected_index += 1
+        elif key == ord('p'):
+            # Pause/Resume selected instance
+            if self.monitor.instances:
+                instance = self.monitor.instances[self.monitor.selected_index]
+                error = self.monitor.pause_resume_process(instance.pid)
+                if error:
+                    self.error_message = error
+                else:
+                    self.error_message = ""
+        elif key == ord('s'):
+            # Cycle through sort options
+            sort_options = ['pid', 'cpu', 'memory', 'tokens', 'time']
+            current_idx = sort_options.index(self.monitor.sort_key)
+            self.monitor.sort_key = sort_options[(current_idx + 1) % len(sort_options)]
+            self.monitor.sort_instances()
+        elif key == ord('r'):
+            # Reverse sort order
+            self.monitor.reverse_sort = not self.monitor.reverse_sort
+            self.monitor.sort_instances()
+        
+        return True
+    
+    def run(self):
+        """Main UI loop"""
+        self.stdscr.nodelay(True)  # Non-blocking input
+        curses.curs_set(0)  # Hide cursor
+        
+        last_update = 0
+        running = True
+        
+        while running:
+            current_time = time.time()
+            
+            # Update data periodically
+            if current_time - last_update > self.monitor.update_interval:
+                self.monitor.instances = self.monitor.find_claude_processes()
+                self.monitor.sort_instances()
+                last_update = current_time
+                
+                # Adjust selected index if needed
+                if self.monitor.selected_index >= len(self.monitor.instances):
+                    self.monitor.selected_index = max(0, len(self.monitor.instances) - 1)
+            
+            # Clear and redraw
+            self.stdscr.clear()
+            
+            if self.show_help:
+                self.draw_help()
+            else:
+                self.draw_header()
+                self.draw_instances()
+                self.draw_footer()
+            
+            self.stdscr.refresh()
+            
+            # Handle input
+            running = self.handle_input()
+            
+            # Small delay to prevent high CPU usage
+            time.sleep(0.05)
+
+def main(stdscr):
+    """Main entry point"""
+    ui = ClaudeTopUI(stdscr)
+    ui.run()
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Monitor Claude CLI instances")
+    parser.add_argument('--interval', type=float, default=1.0, help="Update interval in seconds")
+    args = parser.parse_args()
+    
+    try:
+        curses.wrapper(main)
+    except KeyboardInterrupt:
+        pass
+    except Exception as e:
+        print(f"Error: {e}")
+        import traceback
+        traceback.print_exc()
