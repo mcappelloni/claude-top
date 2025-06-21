@@ -1,0 +1,50 @@
+# Test files
+test_*.py
+*.db
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+env/
+
+# Git
+.git/
+.gitignore
+
+# Development files
+.cursorrules
+.windsurfrules
+.claude/
+CLAUDE.md
+.mcp.json
+
+# Database files
+*.db
+*.sqlite
+*.sqlite3
+
+# macOS
+.DS_Store
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Logs
+*.log
+
+# Documentation source
+docs/
+
+# Build artifacts
+build/
+dist/
+*.egg-info/
