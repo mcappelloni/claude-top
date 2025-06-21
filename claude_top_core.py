@@ -22,8 +22,9 @@ class ClaudeInstance:
     cpu_history: deque = field(default_factory=lambda: deque(maxlen=5))
     net_bytes_sent: int = 0
     net_bytes_recv: int = 0
-    disk_read_bytes: int = 0
-    disk_write_bytes: int = 0
+    net_bytes_total: int = 0
+    disk_total_bytes: int = 0
+    disk_current_bytes: int = 0  # Current cycle activity
     connections_count: int = 0
     mcp_connections: int = 0
 
@@ -115,8 +116,9 @@ class ClaudeMonitor:
                 cpu_history=self.cpu_histories[pid].copy(),
                 net_bytes_sent=net_io['bytes_sent'],
                 net_bytes_recv=net_io['bytes_recv'],
-                disk_read_bytes=disk_io['read_bytes'],
-                disk_write_bytes=disk_io['write_bytes'],
+                net_bytes_total=net_io['bytes_total'],
+                disk_total_bytes=disk_io['total_bytes'],
+                disk_current_bytes=disk_io['current_bytes'],
                 connections_count=connections_info['total_connections'],
                 mcp_connections=connections_info['mcp_connections']
             )
@@ -164,6 +166,8 @@ class ClaudeMonitor:
             # Initialize I/O tracker if not exists
             if not hasattr(self, 'io_tracker'):
                 self.io_tracker = {}
+            if not hasattr(self, 'io_totals'):
+                self.io_totals = {}
             
             # Get current activity indicators
             current_indicators = self.get_activity_indicators(proc)
@@ -176,27 +180,47 @@ class ClaudeMonitor:
                 memory_delta = current_indicators.get('memory_usage', 0) - prev_indicators.get('memory_usage', 0)
                 files_delta = current_indicators.get('open_files', 0) - prev_indicators.get('open_files', 0)
                 
-                # Estimate disk I/O based on memory and file activity
+                # Estimate current cycle disk I/O
                 estimated_write = max(0, memory_delta // 10)  # Memory growth -> writes
                 estimated_read = abs(files_delta) * 1024  # File activity -> reads
+                current_disk_io = estimated_write + estimated_read
                 
-                disk_stats = {
-                    'read_bytes': estimated_read,
-                    'write_bytes': estimated_write
-                }
-                
-                # Network estimation based on connection activity
+                # Network estimation based on connection activity and CPU
                 conn_count = current_indicators.get('network_connections', 0)
-                net_activity = conn_count * 2048  # Rough estimate per connection
+                cpu_factor = max(1, current_indicators.get('cpu_percent', 0) / 10)  # CPU activity affects network
+                base_net_activity = conn_count * 1024 * cpu_factor  # More sophisticated estimate
+                
+                current_net_sent = int(base_net_activity * 0.6)  # Assume more outbound (requests)
+                current_net_recv = int(base_net_activity * 0.4)  # Less inbound (responses)
+                
+                # Update totals
+                if pid not in self.io_totals:
+                    self.io_totals[pid] = {
+                        'total_net_sent': 0, 'total_net_recv': 0, 'total_disk': 0
+                    }
+                
+                self.io_totals[pid]['total_net_sent'] += current_net_sent
+                self.io_totals[pid]['total_net_recv'] += current_net_recv
+                self.io_totals[pid]['total_disk'] += current_disk_io
                 
                 net_stats = {
-                    'bytes_sent': net_activity // 2,
-                    'bytes_recv': net_activity // 2
+                    'bytes_sent': current_net_sent,
+                    'bytes_recv': current_net_recv,
+                    'bytes_total': self.io_totals[pid]['total_net_sent'] + self.io_totals[pid]['total_net_recv']
+                }
+                
+                disk_stats = {
+                    'total_bytes': self.io_totals[pid]['total_disk'],
+                    'current_bytes': current_disk_io
                 }
             else:
                 # First time seeing this process
-                disk_stats = {'read_bytes': 0, 'write_bytes': 0}
-                net_stats = {'bytes_sent': 0, 'bytes_recv': 0}
+                net_stats = {'bytes_sent': 0, 'bytes_recv': 0, 'bytes_total': 0}
+                disk_stats = {'total_bytes': 0, 'current_bytes': 0}
+                if pid not in self.io_totals:
+                    self.io_totals[pid] = {
+                        'total_net_sent': 0, 'total_net_recv': 0, 'total_disk': 0
+                    }
             
             # Store current indicators for next comparison
             self.io_tracker[pid] = current_indicators
@@ -211,8 +235,8 @@ class ClaudeMonitor:
             
         except Exception:
             # Return default values on any error
-            return ({'bytes_sent': 0, 'bytes_recv': 0}, 
-                   {'read_bytes': 0, 'write_bytes': 0},
+            return ({'bytes_sent': 0, 'bytes_recv': 0, 'bytes_total': 0}, 
+                   {'total_bytes': 0, 'current_bytes': 0},
                    {'total_connections': 0, 'mcp_connections': 0})
     
     def get_activity_indicators(self, proc):
@@ -221,13 +245,17 @@ class ClaudeMonitor:
             'memory_usage': 0,
             'open_files': 0,
             'threads': 0,
-            'network_connections': 0
+            'network_connections': 0,
+            'cpu_percent': 0
         }
         
         try:
             # Memory usage
             memory_info = proc.memory_info()
             indicators['memory_usage'] = memory_info.rss
+            
+            # CPU usage
+            indicators['cpu_percent'] = proc.cpu_percent()
             
             # Thread count
             indicators['threads'] = proc.num_threads()
