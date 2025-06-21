@@ -279,6 +279,72 @@ class ClaudeMonitor:
         
         return indicators
     
+    def calculate_summary_stats(self, instances):
+        """Calculate comprehensive summary statistics for all Claude instances"""
+        if not instances:
+            return {
+                'session_totals': {'net_in': 0, 'net_out': 0, 'net_total': 0, 'disk_total': 0, 'disk_current': 0},
+                'current_rates': {'net_in_rate': 0, 'net_out_rate': 0, 'disk_rate': 0},
+                'cpu_stats': {'current': 0, 'average': 0, 'count_running': 0, 'count_idle': 0, 'count_waiting': 0, 'count_paused': 0},
+                'memory_stats': {'current': 0, 'average': 0, 'peak': 0},
+                'process_stats': {'total': 0, 'with_mcp': 0, 'total_connections': 0},
+                'historical_averages': {'cpu': 0, 'memory': 0, 'sessions': 0}
+            }
+        
+        # Session totals (cumulative across all processes)
+        session_totals = {
+            'net_in': sum(inst.net_bytes_recv for inst in instances),
+            'net_out': sum(inst.net_bytes_sent for inst in instances), 
+            'net_total': sum(inst.net_bytes_total for inst in instances),
+            'disk_total': sum(inst.disk_total_bytes for inst in instances),
+            'disk_current': sum(inst.disk_current_bytes for inst in instances)
+        }
+        
+        # Current rates (current cycle activity)
+        current_rates = {
+            'net_in_rate': session_totals['net_in'],  # Current cycle in
+            'net_out_rate': session_totals['net_out'], # Current cycle out
+            'disk_rate': session_totals['disk_current']  # Current cycle disk
+        }
+        
+        # CPU statistics
+        cpu_values = [inst.cpu_percent for inst in instances]
+        cpu_stats = {
+            'current': sum(cpu_values),
+            'average': sum(cpu_values) / len(cpu_values) if cpu_values else 0,
+            'count_running': sum(1 for inst in instances if inst.status == 'running'),
+            'count_idle': sum(1 for inst in instances if inst.status == 'idle'),
+            'count_waiting': sum(1 for inst in instances if inst.status == 'waiting'),
+            'count_paused': sum(1 for inst in instances if inst.status == 'paused')
+        }
+        
+        # Memory statistics
+        memory_values = [inst.memory_mb for inst in instances]
+        memory_stats = {
+            'current': sum(memory_values),
+            'average': sum(memory_values) / len(memory_values) if memory_values else 0,
+            'peak': max(memory_values) if memory_values else 0
+        }
+        
+        # Process statistics
+        process_stats = {
+            'total': len(instances),
+            'with_mcp': sum(1 for inst in instances if inst.mcp_connections > 0),
+            'total_connections': sum(inst.connections_count for inst in instances)
+        }
+        
+        # Historical averages (placeholder for core module)
+        historical_averages = {'cpu': 0, 'memory': 0, 'sessions': 0}
+        
+        return {
+            'session_totals': session_totals,
+            'current_rates': current_rates,
+            'cpu_stats': cpu_stats,
+            'memory_stats': memory_stats,
+            'process_stats': process_stats,
+            'historical_averages': historical_averages
+        }
+    
     def detect_mcp_connections(self, proc):
         """Detect potential MCP connections"""
         try:

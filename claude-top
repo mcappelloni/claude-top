@@ -76,17 +76,28 @@ class ClaudeMonitor:
     def find_claude_processes(self):
         """Find all Claude CLI processes running on the system"""
         claude_processes = []
+        current_pid = os.getpid()  # Get claude-top's own PID
         
         for proc in psutil.process_iter(['pid', 'name', 'cmdline', 'cwd', 'create_time', 'cpu_percent', 'memory_info']):
             try:
+                # Skip our own process (claude-top)
+                if proc.info['pid'] == current_pid:
+                    continue
+                
                 # Check if this is a Claude CLI process
                 cmdline = proc.info.get('cmdline', [])
                 if cmdline and any('claude' in cmd.lower() for cmd in cmdline):
                     # Filter out non-CLI Claude processes
                     cmdline_str = ' '.join(cmdline)
+                    
                     # Skip Claude desktop app processes
                     if 'Claude.app' in cmdline_str or 'Claude Helper' in cmdline_str or 'chrome_crashpad' in cmdline_str or 'Squirrel' in cmdline_str:
                         continue
+                    
+                    # Skip claude-top itself (additional check by command)
+                    if 'claude-top' in cmdline_str or './claude-top' in cmdline_str:
+                        continue
+                    
                     # Skip docker processes unless they're Claude-related containers
                     if 'docker' in cmdline_str and 'mcp/filesystem' in cmdline_str:
                         continue
@@ -155,6 +166,85 @@ class ClaudeMonitor:
         project_id = self.db.get_or_create_project(working_dir)
         self.project_cache[working_dir] = project_id
         return project_id
+    
+    def calculate_summary_stats(self, instances: List[ClaudeInstance]) -> Dict[str, any]:
+        """Calculate comprehensive summary statistics for all Claude instances"""
+        if not instances:
+            return {
+                'session_totals': {'net_in': 0, 'net_out': 0, 'net_total': 0, 'disk_total': 0, 'disk_current': 0},
+                'current_rates': {'net_in_rate': 0, 'net_out_rate': 0, 'disk_rate': 0},
+                'cpu_stats': {'current': 0, 'average': 0, 'count_running': 0, 'count_idle': 0, 'count_waiting': 0},
+                'memory_stats': {'current': 0, 'average': 0, 'peak': 0},
+                'process_stats': {'total': 0, 'with_mcp': 0, 'total_connections': 0},
+                'historical_averages': {'cpu': 0, 'memory': 0, 'sessions': 0}
+            }
+        
+        # Session totals (cumulative across all processes)
+        session_totals = {
+            'net_in': sum(inst.net_bytes_recv for inst in instances),
+            'net_out': sum(inst.net_bytes_sent for inst in instances), 
+            'net_total': sum(inst.net_bytes_total for inst in instances),
+            'disk_total': sum(inst.disk_total_bytes for inst in instances),
+            'disk_current': sum(inst.disk_current_bytes for inst in instances)
+        }
+        
+        # Current rates (current cycle activity)
+        current_rates = {
+            'net_in_rate': session_totals['net_in'],  # Current cycle in
+            'net_out_rate': session_totals['net_out'], # Current cycle out
+            'disk_rate': session_totals['disk_current']  # Current cycle disk
+        }
+        
+        # CPU statistics
+        cpu_values = [inst.cpu_percent for inst in instances]
+        cpu_stats = {
+            'current': sum(cpu_values),
+            'average': sum(cpu_values) / len(cpu_values) if cpu_values else 0,
+            'count_running': sum(1 for inst in instances if inst.status == 'running'),
+            'count_idle': sum(1 for inst in instances if inst.status == 'idle'),
+            'count_waiting': sum(1 for inst in instances if inst.status == 'waiting'),
+            'count_paused': sum(1 for inst in instances if inst.status == 'paused')
+        }
+        
+        # Memory statistics
+        memory_values = [inst.memory_mb for inst in instances]
+        memory_stats = {
+            'current': sum(memory_values),
+            'average': sum(memory_values) / len(memory_values) if memory_values else 0,
+            'peak': max(memory_values) if memory_values else 0
+        }
+        
+        # Process statistics
+        process_stats = {
+            'total': len(instances),
+            'with_mcp': sum(1 for inst in instances if inst.mcp_connections > 0),
+            'total_connections': sum(inst.connections_count for inst in instances)
+        }
+        
+        # Historical averages from database
+        historical_averages = {'cpu': 0, 'memory': 0, 'sessions': 0}
+        if self.enable_database and self.db:
+            try:
+                from analytics import ClaudeAnalytics
+                analytics = ClaudeAnalytics(self.db.db_path)
+                reports = analytics.generate_usage_report(7)  # Last 7 days
+                if reports:
+                    historical_averages = {
+                        'cpu': sum(r.avg_cpu_percent for r in reports) / len(reports),
+                        'memory': sum(r.avg_memory_mb for r in reports) / len(reports),
+                        'sessions': sum(r.session_count for r in reports)
+                    }
+            except:
+                pass
+        
+        return {
+            'session_totals': session_totals,
+            'current_rates': current_rates,
+            'cpu_stats': cpu_stats,
+            'memory_stats': memory_stats,
+            'process_stats': process_stats,
+            'historical_averages': historical_averages
+        }
     
     def parse_claude_process(self, proc) -> Optional[ClaudeInstance]:
         """Parse process information to create ClaudeInstance"""
@@ -466,10 +556,19 @@ class ClaudeTopUI:
             return f"{bytes_value/(1024*1024):.1f}M"
         else:
             return f"{bytes_value/(1024*1024*1024):.1f}G"
+    
+    def create_usage_bar(self, percentage: float, width: int = 20) -> str:
+        """Create a htop-style usage bar"""
+        filled = int((percentage / 100.0) * width)
+        bar = "█" * filled + "░" * (width - filled)
+        return f"[{bar}]"
         
     def draw_header(self):
-        """Draw the header with title and stats"""
+        """Draw the header with title and htop-style summary"""
         height, width = self.stdscr.getmaxyx()
+        
+        # Calculate summary statistics
+        stats = self.monitor.calculate_summary_stats(self.monitor.instances)
         
         # Title
         title = "═══ Claude-Top - Claude CLI Monitor ═══"
@@ -477,16 +576,46 @@ class ClaudeTopUI:
         self.stdscr.addstr(0, (width - len(title)) // 2, title)
         self.stdscr.attroff(curses.color_pair(4) | curses.A_BOLD)
         
-        # Stats line
-        num_instances = len(self.monitor.instances)
-        num_running = sum(1 for i in self.monitor.instances if i.status == 'running')
-        num_waiting = sum(1 for i in self.monitor.instances if i.status == 'waiting')
-        num_idle = sum(1 for i in self.monitor.instances if i.status == 'idle')
-        num_paused = sum(1 for i in self.monitor.instances if i.status == 'paused')
-        total_tokens = sum(i.tokens_used for i in self.monitor.instances)
+        # Left column - Process and CPU stats
+        left_col = 2
+        self.stdscr.addstr(1, left_col, f"Processes: {stats['process_stats']['total']} total")
+        self.stdscr.addstr(2, left_col, f"  Running: {stats['cpu_stats']['count_running']}  Idle: {stats['cpu_stats']['count_idle']}  Waiting: {stats['cpu_stats']['count_waiting']}")
         
-        stats = f"Instances: {num_instances} | Running: {num_running} | Waiting: {num_waiting} | Idle: {num_idle} | Paused: {num_paused}"
-        self.stdscr.addstr(1, 2, stats)
+        # CPU usage bar (similar to htop)
+        cpu_percent = min(stats['cpu_stats']['current'], 100.0)
+        cpu_bar = self.create_usage_bar(cpu_percent, 30)
+        self.stdscr.addstr(3, left_col, f"CPU: {cpu_percent:5.1f}% {cpu_bar}")
+        
+        # Memory usage (show total and average)
+        mem_total = stats['memory_stats']['current']
+        mem_avg = stats['memory_stats']['average']
+        mem_bar = self.create_usage_bar(min(mem_avg, 1000) / 10, 30)  # Scale for visualization
+        self.stdscr.addstr(4, left_col, f"Mem: {mem_total:7.1f}MB total {mem_bar}")
+        
+        # Right column - Network and Disk I/O
+        right_col = width // 2 + 5
+        if right_col < width - 40:  # Only if there's enough space
+            # Session totals
+            net_total_formatted = self.format_bytes(stats['session_totals']['net_total'])
+            disk_total_formatted = self.format_bytes(stats['session_totals']['disk_total'])
+            self.stdscr.addstr(1, right_col, f"Session Totals:")
+            self.stdscr.addstr(2, right_col, f"  Network: {net_total_formatted}")
+            self.stdscr.addstr(3, right_col, f"  Disk I/O: {disk_total_formatted}")
+            
+            # Current rates
+            net_in_rate = self.format_bytes(stats['current_rates']['net_in_rate'])
+            net_out_rate = self.format_bytes(stats['current_rates']['net_out_rate'])
+            disk_rate = self.format_bytes(stats['current_rates']['disk_rate'])
+            self.stdscr.addstr(4, right_col, f"  Current: ↓{net_in_rate} ↑{net_out_rate} ⚡{disk_rate}")
+        
+        # Additional stats line
+        connections = stats['process_stats']['total_connections']
+        mcp_count = stats['process_stats']['with_mcp']
+        historical_sessions = stats['historical_averages']['sessions']
+        
+        additional_stats = f"Connections: {connections} | MCP: {mcp_count} | Historical Sessions (7d): {historical_sessions}"
+        if len(additional_stats) < width - 4:
+            self.stdscr.addstr(5, left_col, additional_stats)
         
         # Column headers with sort indicator
         sort_indicators = {
@@ -531,13 +660,13 @@ class ClaudeTopUI:
                     header_line += label
         
         self.stdscr.attron(curses.A_UNDERLINE)
-        self.stdscr.addstr(3, 0, header_line[:width-1])
+        self.stdscr.addstr(7, 0, header_line[:width-1])  # Moved down to line 7
         self.stdscr.attroff(curses.A_UNDERLINE)
         
     def draw_instances(self):
         """Draw the list of Claude instances"""
         height, width = self.stdscr.getmaxyx()
-        start_y = 4
+        start_y = 8  # Start after expanded header
         visible_lines = height - start_y - 3  # Leave room for footer
         
         for idx, instance in enumerate(self.monitor.instances[:visible_lines]):
@@ -615,8 +744,9 @@ class ClaudeTopUI:
             self.stdscr.addstr(height-3, 2, self.error_message[:width-4])
             self.stdscr.attroff(curses.color_pair(3))
         
-        # Commands
-        commands = "q:Quit  p:Pause/Resume  k:Kill  s:Sort  f:Path  h:Help  ↑↓:Navigate"
+        # Commands with database indicator
+        db_status = " [DB]" if self.monitor.enable_database else ""
+        commands = f"q:Quit  p:Pause/Resume  k:Kill  s:Sort  f:Path  d:Stats  h:Help  ↑↓:Navigate{db_status}"
         self.stdscr.addstr(height-1, 2, commands[:width-4])
     
     def draw_help(self):
