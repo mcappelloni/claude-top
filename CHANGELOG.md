@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **Search & Filter**: Real-time process filtering by PID, status, command, or directory
+- **Batch Operations**: Multi-select mode for managing multiple processes at once
+  - Select multiple processes with checkboxes
+  - Batch pause/resume operations
+  - Batch kill with confirmation dialog
+- **Project Grouping**: Group processes by project/workspace
+  - Toggle grouping with 'g' key
+  - Aggregate CPU/memory stats per project
+  - Hierarchical display with indentation
+
 ### Fixed
 - Improved process state detection to properly distinguish between:
   - "waiting": Claude is in an active conversation but waiting for user input

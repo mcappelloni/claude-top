@@ -19,6 +19,9 @@ A terminal-based monitoring tool for Claude CLI instances, similar to Unix `top`
 - **Smart Filtering**: Automatically excludes Claude desktop app and self-processes
 - **Interactive Controls**: Advanced sorting, navigation, and display options
 - **Visual Indicators**: Process states, resource warnings, and sort indicators
+- **Search & Filter**: Find processes quickly by PID, status, command, or directory
+- **Batch Operations**: Select and manage multiple processes simultaneously
+- **Project Grouping**: Organize processes by project with aggregate statistics
 
 ## Quick Start with npx
 
@@ -83,6 +86,20 @@ claude-top --interval 2.0
 - **↑/↓** or **k/j**: Navigate through processes  
 - **Home/End**: Jump to first/last process
 
+### Search & Filter
+- **/**: Enter search mode (search by PID, status, command, or directory)
+- **ESC**: Clear search or exit search mode
+- Real-time filtering as you type
+
+### Multi-Select Mode
+- **m**: Enter multi-select mode
+- **Space**: Toggle selection on current process
+- **a**: Select all visible processes
+- **n**: Clear all selections
+- **p**: Pause/resume all selected processes
+- **K**: Kill all selected processes (with confirmation)
+- **ESC**: Exit multi-select mode
+
 ### Process Control
 - **p**: Pause/Resume selected Claude instance
 - **K** (capital): Kill selected instance with confirmation dialog
@@ -94,6 +111,7 @@ claude-top --interval 2.0
 - **s**: Cycle through sort columns (PID → CPU% → Memory → Net↑ → Net↓ → NetΣ → DiskΣ → Disk∆ → Connections → Time)
 - **r**: Reverse sort order
 - **f**: Toggle between full path and abbreviated directory display
+- **g**: Toggle project grouping (group by parent directory)
 - **d**: Show database statistics (if enabled)
 
 ### General
