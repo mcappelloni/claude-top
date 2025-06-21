@@ -88,8 +88,8 @@ class ClaudeMonitor:
             # For now, we'll use a placeholder for task
             task = "Active Session"
             
-            # Get context and token information (would need to read from Claude's state files)
-            context_length, tokens_used = self.get_claude_metrics(pid, cwd)
+            # Token/context information not available from external sources
+            context_length, tokens_used = 0, 0
             
             # Initialize CPU history for new processes
             if pid not in self.cpu_histories:
@@ -134,21 +134,10 @@ class ClaudeMonitor:
         return "Unknown Task"
     
     def get_claude_metrics(self, pid: int, working_dir: str) -> tuple:
-        """Get context length and token usage from Claude's state files"""
-        # Look for Claude state files in the working directory
-        # This is hypothetical - actual implementation would depend on Claude's file format
-        try:
-            state_file = Path(working_dir) / '.claude' / 'state.json'
-            if state_file.exists():
-                with open(state_file, 'r') as f:
-                    state = json.load(f)
-                    return state.get('context_length', 0), state.get('tokens_used', 0)
-        except Exception:
-            pass
-        
-        # Return mock data for demonstration
-        import random
-        return random.randint(1000, 50000), random.randint(100, 10000)
+        """Token/context information not available from external sources"""
+        # Claude CLI does not expose token/context data in accessible files
+        # This information is only available internally via /cost command
+        return 0, 0
     
     def pause_resume_process(self, pid: int):
         """Pause or resume a process"""
@@ -198,8 +187,7 @@ class ClaudeMonitor:
             self.instances.sort(key=lambda x: x.cpu_percent, reverse=self.reverse_sort)
         elif self.sort_key == 'memory':
             self.instances.sort(key=lambda x: x.memory_mb, reverse=self.reverse_sort)
-        elif self.sort_key == 'tokens':
-            self.instances.sort(key=lambda x: x.tokens_used, reverse=self.reverse_sort)
+        # Removed token sorting - not available
         elif self.sort_key == 'time':
             self.instances.sort(key=lambda x: x.start_time, reverse=self.reverse_sort)
 
@@ -250,14 +238,12 @@ class ClaudeTopUI:
             'time': 'Time'
         }
         
-        # Build headers with sort indicator - removed Task column
+        # Build headers with sort indicator - removed misleading Token/Context columns
         headers_parts = [
             ('PID', 7, 'pid'),
             ('Status', 10, None),
             ('CPU%', 6, 'cpu'),
             ('Mem(MB)', 8, 'memory'),
-            ('Tokens', 10, 'tokens'),
-            ('Context', 10, None),
             ('Time', 8, 'time'),
             ('Working Directory', 0, None)
         ]
@@ -328,11 +314,11 @@ class ClaudeTopUI:
                 else:
                     dir_display = instance.working_dir
             
-            # Build row with selection indicator
+            # Build row with selection indicator - removed token/context columns
             if is_selected:
-                row = f"→ {instance.pid:>6} {instance.status:>10} {instance.cpu_percent:>6.1f} {instance.memory_mb:>8.1f} {instance.tokens_used:>10,} {instance.context_length:>10,} {elapsed_str:>8} {dir_display}"
+                row = f"→ {instance.pid:>6} {instance.status:>10} {instance.cpu_percent:>6.1f} {instance.memory_mb:>8.1f} {elapsed_str:>8} {dir_display}"
             else:
-                row = f"  {instance.pid:>6} {instance.status:>10} {instance.cpu_percent:>6.1f} {instance.memory_mb:>8.1f} {instance.tokens_used:>10,} {instance.context_length:>10,} {elapsed_str:>8} {dir_display}"
+                row = f"  {instance.pid:>6} {instance.status:>10} {instance.cpu_percent:>6.1f} {instance.memory_mb:>8.1f} {elapsed_str:>8} {dir_display}"
             
             self.stdscr.attron(color)
             self.stdscr.addstr(y, 0, row[:width-1])
@@ -428,8 +414,8 @@ class ClaudeTopUI:
                 else:
                     self.error_message = ""
         elif key == ord('s'):
-            # Cycle through sort options
-            sort_options = ['pid', 'cpu', 'memory', 'tokens', 'time']
+            # Cycle through sort options - removed tokens
+            sort_options = ['pid', 'cpu', 'memory', 'time']
             current_idx = sort_options.index(self.monitor.sort_key)
             self.monitor.sort_key = sort_options[(current_idx + 1) % len(sort_options)]
             self.monitor.sort_instances()
