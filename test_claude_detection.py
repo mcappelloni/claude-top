@@ -13,11 +13,27 @@ def find_claude_processes():
             # Check if this is a Claude CLI process
             cmdline = proc.info.get('cmdline', [])
             if cmdline and any('claude' in cmd.lower() for cmd in cmdline):
+                cmdline_str = ' '.join(cmdline)
+                # Skip Claude desktop app processes
+                if 'Claude.app' in cmdline_str or 'Claude Helper' in cmdline_str or 'chrome_crashpad' in cmdline_str or 'Squirrel' in cmdline_str:
+                    continue
+                # Skip docker processes unless they're Claude-related containers
+                if 'docker' in cmdline_str and 'mcp/filesystem' in cmdline_str:
+                    continue
+                    
+                # Try to get working directory
+                cwd = proc.info.get('cwd', None)
+                if not cwd or cwd == '/':
+                    try:
+                        cwd = proc.cwd()
+                    except:
+                        cwd = 'Unknown'
+                
                 # Print process information
-                print(f"\nFound Claude process:")
+                print(f"\nFound Claude CLI process:")
                 print(f"  PID: {proc.info['pid']}")
-                print(f"  Command: {' '.join(cmdline)}")
-                print(f"  Working Dir: {proc.info.get('cwd', 'Unknown')}")
+                print(f"  Command: {cmdline_str}")
+                print(f"  Working Dir: {cwd}")
                 print(f"  CPU %: {proc.info.get('cpu_percent', 0.0)}")
                 print(f"  Memory MB: {proc.info.get('memory_info').rss / 1024 / 1024 if proc.info.get('memory_info') else 0:.2f}")
                 print(f"  Status: {proc.status()}")

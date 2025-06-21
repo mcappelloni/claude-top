@@ -37,6 +37,7 @@ class ClaudeMonitor:
         self.update_interval = 1.0
         self.sort_key = 'pid'
         self.reverse_sort = False
+        self.show_full_path = False
         
     def find_claude_processes(self):
         """Find all Claude CLI processes running on the system"""
@@ -47,6 +48,15 @@ class ClaudeMonitor:
                 # Check if this is a Claude CLI process
                 cmdline = proc.info.get('cmdline', [])
                 if cmdline and any('claude' in cmd.lower() for cmd in cmdline):
+                    # Filter out non-CLI Claude processes
+                    cmdline_str = ' '.join(cmdline)
+                    # Skip Claude desktop app processes
+                    if 'Claude.app' in cmdline_str or 'Claude Helper' in cmdline_str or 'chrome_crashpad' in cmdline_str or 'Squirrel' in cmdline_str:
+                        continue
+                    # Skip docker processes unless they're Claude-related containers
+                    if 'docker' in cmdline_str and 'mcp/filesystem' in cmdline_str:
+                        continue
+                    
                     # Extract relevant information
                     instance = self.parse_claude_process(proc)
                     if instance:
@@ -61,11 +71,19 @@ class ClaudeMonitor:
         try:
             info = proc.info
             pid = info['pid']
-            cwd = info.get('cwd', 'Unknown')
+            # Get working directory - try multiple methods
+            cwd = info.get('cwd', None)
+            if not cwd or cwd == '/':
+                try:
+                    # Try to get cwd directly from process
+                    cwd = proc.cwd()
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    cwd = 'Unknown'
+            
             cmdline = ' '.join(info.get('cmdline', []))
             
-            # Try to extract task information from command line or process metadata
-            task = self.extract_task_from_cmdline(cmdline)
+            # For now, we'll use a placeholder for task
+            task = "Active Session"
             
             # Get context and token information (would need to read from Claude's state files)
             context_length, tokens_used = self.get_claude_metrics(pid, cwd)
@@ -186,10 +204,46 @@ class ClaudeTopUI:
         stats = f"Instances: {num_instances} | Running: {num_running} | Paused: {num_paused} | Total Tokens: {total_tokens:,}"
         self.stdscr.addstr(1, 2, stats)
         
-        # Column headers
-        headers = f"{'PID':>7} {'Status':>10} {'CPU%':>6} {'Mem(MB)':>8} {'Tokens':>10} {'Context':>10} {'Time':>8} {'Dir':>20} {'Task'}"
+        # Column headers with sort indicator
+        sort_indicators = {
+            'pid': 'PID',
+            'cpu': 'CPU%',
+            'memory': 'Mem(MB)',
+            'tokens': 'Tokens',
+            'time': 'Time'
+        }
+        
+        # Build headers with sort indicator - removed Task column
+        headers_parts = [
+            ('PID', 7, 'pid'),
+            ('Status', 10, None),
+            ('CPU%', 6, 'cpu'),
+            ('Mem(MB)', 8, 'memory'),
+            ('Tokens', 10, 'tokens'),
+            ('Context', 10, None),
+            ('Time', 8, 'time'),
+            ('Working Directory', 0, None)
+        ]
+        
+        header_line = ""
+        pos = 0
+        for label, width, sort_field in headers_parts:
+            if sort_field == self.monitor.sort_key:
+                # Add sort indicator
+                indicator = '▼' if self.monitor.reverse_sort else '▲'
+                if width > 0:
+                    display_label = f"{label}{indicator}"
+                    header_line += f"{display_label:>{width}} "
+                else:
+                    header_line += f"{label}{indicator}"
+            else:
+                if width > 0:
+                    header_line += f"{label:>{width}} "
+                else:
+                    header_line += label
+        
         self.stdscr.attron(curses.A_UNDERLINE)
-        self.stdscr.addstr(3, 0, headers[:width-1])
+        self.stdscr.addstr(3, 0, header_line[:width-1])
         self.stdscr.attroff(curses.A_UNDERLINE)
         
     def draw_instances(self):
@@ -202,7 +256,8 @@ class ClaudeTopUI:
             y = start_y + idx
             
             # Highlight selected row
-            if idx == self.monitor.selected_index:
+            is_selected = idx == self.monitor.selected_index
+            if is_selected:
                 self.stdscr.attron(curses.color_pair(5))
             
             # Color based on status
@@ -221,16 +276,28 @@ class ClaudeTopUI:
             elapsed = datetime.now() - instance.start_time
             elapsed_str = f"{elapsed.seconds//3600:02d}:{(elapsed.seconds//60)%60:02d}:{elapsed.seconds%60:02d}"
             
-            dir_short = instance.working_dir.split('/')[-1] if '/' in instance.working_dir else instance.working_dir
-            task_short = instance.task[:30] + '...' if len(instance.task) > 30 else instance.task
+            # Directory display based on setting - expanded width without task column
+            if self.monitor.show_full_path:
+                dir_display = instance.working_dir
+            else:
+                # Show last two directories for better context
+                parts = instance.working_dir.split('/')
+                if len(parts) > 2:
+                    dir_display = '/'.join(parts[-2:])
+                else:
+                    dir_display = instance.working_dir
             
-            row = f"{instance.pid:>7} {instance.status:>10} {instance.cpu_percent:>6.1f} {instance.memory_mb:>8.1f} {instance.tokens_used:>10,} {instance.context_length:>10,} {elapsed_str:>8} {dir_short:>20} {task_short}"
+            # Build row with selection indicator
+            if is_selected:
+                row = f"→ {instance.pid:>6} {instance.status:>10} {instance.cpu_percent:>6.1f} {instance.memory_mb:>8.1f} {instance.tokens_used:>10,} {instance.context_length:>10,} {elapsed_str:>8} {dir_display}"
+            else:
+                row = f"  {instance.pid:>6} {instance.status:>10} {instance.cpu_percent:>6.1f} {instance.memory_mb:>8.1f} {instance.tokens_used:>10,} {instance.context_length:>10,} {elapsed_str:>8} {dir_display}"
             
             self.stdscr.attron(color)
             self.stdscr.addstr(y, 0, row[:width-1])
             self.stdscr.attroff(color)
             
-            if idx == self.monitor.selected_index:
+            if is_selected:
                 self.stdscr.attroff(curses.color_pair(5))
     
     def draw_footer(self):
@@ -244,7 +311,7 @@ class ClaudeTopUI:
             self.stdscr.attroff(curses.color_pair(3))
         
         # Commands
-        commands = "q:Quit  p:Pause/Resume  k:Kill  s:Sort  h:Help  ↑↓:Navigate"
+        commands = "q:Quit  p:Pause/Resume  k:Kill  s:Sort  f:Path  h:Help  ↑↓:Navigate"
         self.stdscr.addstr(height-1, 2, commands[:width-4])
     
     def draw_help(self):
@@ -260,6 +327,7 @@ class ClaudeTopUI:
             "Actions:",
             "  p           - Pause/Resume selected instance",
             "  k           - Kill selected instance",
+            "  f           - Toggle full/short directory path",
             "  Enter       - View detailed information",
             "",
             "Sorting:",
@@ -294,7 +362,9 @@ class ClaudeTopUI:
         key = self.stdscr.getch()
         
         if self.show_help:
-            self.show_help = False
+            # Wait for any key press to close help
+            if key != -1:
+                self.show_help = False
             return True
         
         if key == ord('q') or key == 27:  # q or ESC
@@ -325,6 +395,10 @@ class ClaudeTopUI:
         elif key == ord('r'):
             # Reverse sort order
             self.monitor.reverse_sort = not self.monitor.reverse_sort
+        
+        elif key == ord('f') or key == ord('F'):
+            # Toggle full path display
+            self.monitor.show_full_path = not self.monitor.show_full_path
             self.monitor.sort_instances()
         
         return True
