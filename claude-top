@@ -9,10 +9,11 @@ import os
 import psutil
 import signal
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import List, Optional, Dict
+from collections import deque
 import subprocess
 import argparse
 
@@ -24,10 +25,11 @@ class ClaudeInstance:
     context_length: int
     tokens_used: int
     start_time: datetime
-    status: str  # 'running', 'paused', 'completed'
+    status: str  # 'running', 'idle', 'waiting', 'paused'
     cpu_percent: float
     memory_mb: float
     command: str
+    cpu_history: deque = field(default_factory=lambda: deque(maxlen=5))
 
 class ClaudeMonitor:
     def __init__(self):
@@ -38,6 +40,7 @@ class ClaudeMonitor:
         self.sort_key = 'pid'
         self.reverse_sort = False
         self.show_full_path = False
+        self.cpu_histories = {}  # Track CPU history for each PID
         
     def find_claude_processes(self):
         """Find all Claude CLI processes running on the system"""
@@ -88,12 +91,16 @@ class ClaudeMonitor:
             # Get context and token information (would need to read from Claude's state files)
             context_length, tokens_used = self.get_claude_metrics(pid, cwd)
             
-            # Check if process is paused
-            status = 'paused' if pid in self.paused_pids else proc.status()
-            if status == 'stopped':
-                status = 'paused'
-            elif status in ['running', 'sleeping']:
-                status = 'running'
+            # Initialize CPU history for new processes
+            if pid not in self.cpu_histories:
+                self.cpu_histories[pid] = deque(maxlen=5)
+            
+            # Update CPU history
+            current_cpu = info.get('cpu_percent', 0.0)
+            self.cpu_histories[pid].append(current_cpu)
+            
+            # Determine status based on CPU usage patterns
+            status = self.determine_process_status(pid, proc)
             
             return ClaudeInstance(
                 pid=pid,
@@ -105,7 +112,8 @@ class ClaudeMonitor:
                 status=status,
                 cpu_percent=info.get('cpu_percent', 0.0),
                 memory_mb=info.get('memory_info').rss / 1024 / 1024 if info.get('memory_info') else 0,
-                command=cmdline
+                command=cmdline,
+                cpu_history=self.cpu_histories[pid].copy()
             )
         except Exception:
             return None
@@ -155,6 +163,33 @@ class ClaudeMonitor:
             return f"Error: {str(e)}"
         return None
     
+    def determine_process_status(self, pid, proc):
+        """Determine process status based on CPU usage patterns"""
+        # Check if manually paused
+        if pid in self.paused_pids:
+            return 'paused'
+        
+        # Check system status
+        sys_status = proc.status()
+        if sys_status == 'stopped':
+            return 'paused'
+        
+        # Analyze CPU history
+        cpu_samples = list(self.cpu_histories[pid])
+        if len(cpu_samples) >= 3:
+            avg_cpu = sum(cpu_samples) / len(cpu_samples)
+            max_cpu = max(cpu_samples)
+            
+            if avg_cpu < 0.5 and max_cpu < 1.0:
+                return 'waiting'  # Waiting for user input
+            elif avg_cpu > 5.0:
+                return 'running'  # Actively processing
+            else:
+                return 'idle'     # Minimal activity
+        
+        # Default to running for new processes
+        return 'running'
+    
     def sort_instances(self):
         """Sort instances by the current sort key"""
         if self.sort_key == 'pid':
@@ -198,10 +233,12 @@ class ClaudeTopUI:
         # Stats line
         num_instances = len(self.monitor.instances)
         num_running = sum(1 for i in self.monitor.instances if i.status == 'running')
+        num_waiting = sum(1 for i in self.monitor.instances if i.status == 'waiting')
+        num_idle = sum(1 for i in self.monitor.instances if i.status == 'idle')
         num_paused = sum(1 for i in self.monitor.instances if i.status == 'paused')
         total_tokens = sum(i.tokens_used for i in self.monitor.instances)
         
-        stats = f"Instances: {num_instances} | Running: {num_running} | Paused: {num_paused} | Total Tokens: {total_tokens:,}"
+        stats = f"Instances: {num_instances} | Running: {num_running} | Waiting: {num_waiting} | Idle: {num_idle} | Paused: {num_paused}"
         self.stdscr.addstr(1, 2, stats)
         
         # Column headers with sort indicator
@@ -262,9 +299,13 @@ class ClaudeTopUI:
             
             # Color based on status
             if instance.status == 'running':
-                color = curses.color_pair(1)
+                color = curses.color_pair(1)  # Green
+            elif instance.status == 'waiting':
+                color = curses.color_pair(4)  # Cyan - waiting for user
+            elif instance.status == 'idle':
+                color = curses.color_pair(0)  # Default - minimal activity
             elif instance.status == 'paused':
-                color = curses.color_pair(2)
+                color = curses.color_pair(2)  # Yellow
             else:
                 color = curses.color_pair(0)
             
@@ -419,6 +460,10 @@ class ClaudeTopUI:
                 self.monitor.instances = self.monitor.find_claude_processes()
                 self.monitor.sort_instances()
                 last_update = current_time
+                
+                # Clean up old CPU histories
+                current_pids = {inst.pid for inst in self.monitor.instances}
+                self.monitor.cpu_histories = {pid: hist for pid, hist in self.monitor.cpu_histories.items() if pid in current_pids}
                 
                 # Adjust selected index if needed
                 if self.monitor.selected_index >= len(self.monitor.instances):
