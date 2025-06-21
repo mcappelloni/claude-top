@@ -57,6 +57,8 @@ class ClaudeMonitor:
         self.reverse_sort = False
         self.show_full_path = False
         self.cpu_histories = {}  # Track CPU history for each PID
+        self.group_by_project = False
+        self.project_groups = {}  # project_path -> list of instances
         
         # Database tracking
         self.enable_database = enable_database and DATABASE_AVAILABLE
@@ -573,6 +575,27 @@ class ClaudeMonitor:
             self.instances.sort(key=lambda x: x.connections_count, reverse=self.reverse_sort)
         elif self.sort_key == 'time':
             self.instances.sort(key=lambda x: x.start_time, reverse=self.reverse_sort)
+    
+    def group_instances_by_project(self):
+        """Group instances by their working directory (project)"""
+        self.project_groups.clear()
+        
+        for instance in self.instances:
+            # Use parent directory as project identifier
+            project_path = os.path.dirname(instance.working_dir)
+            if project_path not in self.project_groups:
+                self.project_groups[project_path] = []
+            self.project_groups[project_path].append(instance)
+        
+        # Sort instances within each group
+        for project, instances in self.project_groups.items():
+            if self.sort_key == 'pid':
+                instances.sort(key=lambda x: x.pid, reverse=self.reverse_sort)
+            elif self.sort_key == 'cpu':
+                instances.sort(key=lambda x: x.cpu_percent, reverse=self.reverse_sort)
+            elif self.sort_key == 'memory':
+                instances.sort(key=lambda x: x.memory_mb, reverse=self.reverse_sort)
+            # ... other sort options
 
 class ClaudeTopUI:
     def __init__(self, stdscr):
@@ -581,6 +604,11 @@ class ClaudeTopUI:
         self.setup_colors()
         self.error_message = ""
         self.show_help = False
+        self.search_mode = False
+        self.search_query = ""
+        self.filtered_instances = []
+        self.selected_instances = set()  # For batch operations
+        self.multi_select_mode = False
         
     def setup_colors(self):
         """Initialize color pairs"""
@@ -710,90 +738,183 @@ class ClaudeTopUI:
         self.stdscr.addstr(7, 0, header_line[:width-1])  # Moved down to line 7
         self.stdscr.attroff(curses.A_UNDERLINE)
         
+    def apply_search_filter(self):
+        """Apply search filter to instances"""
+        if not self.search_query:
+            self.filtered_instances = self.monitor.instances
+        else:
+            query = self.search_query.lower()
+            self.filtered_instances = [
+                inst for inst in self.monitor.instances
+                if (query in inst.working_dir.lower() or
+                    query in inst.command.lower() or
+                    query in inst.status.lower() or
+                    str(inst.pid) == query)
+            ]
+        
+        # Adjust selected index if needed
+        if self.monitor.selected_index >= len(self.filtered_instances):
+            self.monitor.selected_index = max(0, len(self.filtered_instances) - 1)
+    
+    def draw_grouped_instances(self, start_y, visible_lines, width):
+        """Draw instances grouped by project"""
+        y = start_y
+        line_count = 0
+        
+        # Sort projects by name
+        sorted_projects = sorted(self.monitor.project_groups.keys())
+        
+        for project_idx, project_path in enumerate(sorted_projects):
+            if line_count >= visible_lines:
+                break
+                
+            instances = self.monitor.project_groups[project_path]
+            project_name = os.path.basename(project_path) or "root"
+            
+            # Draw project header
+            self.stdscr.attron(curses.color_pair(4) | curses.A_BOLD)
+            header = f"▼ {project_name} ({len(instances)} instances)"
+            
+            # Add aggregate stats for the project
+            total_cpu = sum(inst.cpu_percent for inst in instances)
+            total_mem = sum(inst.memory_mb for inst in instances)
+            header += f" - CPU: {total_cpu:.1f}% Mem: {total_mem:.0f}MB"
+            
+            self.stdscr.addstr(y, 0, header[:width-1])
+            self.stdscr.attroff(curses.color_pair(4) | curses.A_BOLD)
+            
+            y += 1
+            line_count += 1
+            
+            # Draw instances in this project
+            for inst_idx, instance in enumerate(instances):
+                if line_count >= visible_lines:
+                    break
+                
+                # Indented instance display
+                self.draw_instance_row(instance, y, 2, width, False)  # indent by 2
+                
+                y += 1
+                line_count += 1
+    
+    def draw_instance_row(self, instance, y, indent, width, is_selected):
+        """Draw a single instance row"""
+        # Color based on status
+        if instance.status == 'running':
+            color = curses.color_pair(1)  # Green
+        elif instance.status == 'waiting':
+            color = curses.color_pair(4)  # Cyan - waiting for user
+        elif instance.status == 'idle':
+            color = curses.color_pair(0)  # Default - minimal activity
+        elif instance.status == 'paused':
+            color = curses.color_pair(2)  # Yellow
+        else:
+            color = curses.color_pair(0)
+        
+        # High resource usage warning
+        if instance.cpu_percent > 80 or instance.memory_mb > 1000:
+            color = curses.color_pair(3)
+        
+        # Format the row
+        elapsed = datetime.now() - instance.start_time
+        elapsed_str = f"{elapsed.seconds//3600:02d}:{(elapsed.seconds//60)%60:02d}:{elapsed.seconds%60:02d}"
+        
+        # Directory display
+        if self.monitor.show_full_path:
+            dir_display = instance.working_dir
+        else:
+            parts = instance.working_dir.split('/')
+            if len(parts) > 2:
+                dir_display = '/'.join(parts[-2:])
+            else:
+                dir_display = instance.working_dir
+        
+        # Format I/O data
+        net_out_display = self.format_bytes(instance.net_bytes_sent)
+        net_in_display = self.format_bytes(instance.net_bytes_recv)
+        net_total_display = self.format_bytes(instance.net_bytes_total)
+        disk_total_display = self.format_bytes(instance.disk_total_bytes)
+        disk_current_display = self.format_bytes(instance.disk_current_bytes)
+        
+        # Connection display
+        if instance.mcp_connections > 0:
+            conn_display = f"{instance.connections_count}M"
+        else:
+            conn_display = f"{instance.connections_count}"
+        
+        # Build row
+        spacing = " " * indent
+        if self.multi_select_mode:
+            checkbox = "[×]" if instance.pid in self.selected_instances else "[ ]"
+            selection_indicator = "→" if is_selected else " "
+            row = f"{spacing}{checkbox}{selection_indicator}{instance.pid:>6} {instance.status:>8} {instance.cpu_percent:>6.1f} {instance.memory_mb:>8.1f} {net_out_display:>8} {net_in_display:>8} {net_total_display:>8} {disk_total_display:>8} {disk_current_display:>8} {conn_display:>5} {elapsed_str:>8} {dir_display}"
+        else:
+            if is_selected:
+                row = f"{spacing}→ {instance.pid:>6} {instance.status:>8} {instance.cpu_percent:>6.1f} {instance.memory_mb:>8.1f} {net_out_display:>8} {net_in_display:>8} {net_total_display:>8} {disk_total_display:>8} {disk_current_display:>8} {conn_display:>5} {elapsed_str:>8} {dir_display}"
+            else:
+                row = f"{spacing}  {instance.pid:>6} {instance.status:>8} {instance.cpu_percent:>6.1f} {instance.memory_mb:>8.1f} {net_out_display:>8} {net_in_display:>8} {net_total_display:>8} {disk_total_display:>8} {disk_current_display:>8} {conn_display:>5} {elapsed_str:>8} {dir_display}"
+        
+        if is_selected:
+            self.stdscr.attron(curses.color_pair(5))
+        
+        self.stdscr.attron(color)
+        self.stdscr.addstr(y, 0, row[:width-1])
+        self.stdscr.attroff(color)
+        
+        if is_selected:
+            self.stdscr.attroff(curses.color_pair(5))
+    
     def draw_instances(self):
         """Draw the list of Claude instances"""
         height, width = self.stdscr.getmaxyx()
         start_y = 8  # Start after expanded header
         visible_lines = height - start_y - 3  # Leave room for footer
         
-        for idx, instance in enumerate(self.monitor.instances[:visible_lines]):
-            y = start_y + idx
-            
-            # Highlight selected row
-            is_selected = idx == self.monitor.selected_index
-            if is_selected:
-                self.stdscr.attron(curses.color_pair(5))
-            
-            # Color based on status
-            if instance.status == 'running':
-                color = curses.color_pair(1)  # Green
-            elif instance.status == 'waiting':
-                color = curses.color_pair(4)  # Cyan - waiting for user
-            elif instance.status == 'idle':
-                color = curses.color_pair(0)  # Default - minimal activity
-            elif instance.status == 'paused':
-                color = curses.color_pair(2)  # Yellow
-            else:
-                color = curses.color_pair(0)
-            
-            # High resource usage warning
-            if instance.cpu_percent > 80 or instance.memory_mb > 1000:
-                color = curses.color_pair(3)
-            
-            # Format the row
-            elapsed = datetime.now() - instance.start_time
-            elapsed_str = f"{elapsed.seconds//3600:02d}:{(elapsed.seconds//60)%60:02d}:{elapsed.seconds%60:02d}"
-            
-            # Directory display based on setting - expanded width without task column
-            if self.monitor.show_full_path:
-                dir_display = instance.working_dir
-            else:
-                # Show last two directories for better context
-                parts = instance.working_dir.split('/')
-                if len(parts) > 2:
-                    dir_display = '/'.join(parts[-2:])
-                else:
-                    dir_display = instance.working_dir
-            
-            # Format split I/O data
-            net_out_display = self.format_bytes(instance.net_bytes_sent)
-            net_in_display = self.format_bytes(instance.net_bytes_recv)
-            net_total_display = self.format_bytes(instance.net_bytes_total)
-            disk_total_display = self.format_bytes(instance.disk_total_bytes)
-            disk_current_display = self.format_bytes(instance.disk_current_bytes)
-            
-            # Connection display with MCP indicator
-            if instance.mcp_connections > 0:
-                conn_display = f"{instance.connections_count}M"
-            else:
-                conn_display = f"{instance.connections_count}"
-            
-            # Build row with selection indicator - split I/O columns
-            if is_selected:
-                row = f"→ {instance.pid:>6} {instance.status:>8} {instance.cpu_percent:>6.1f} {instance.memory_mb:>8.1f} {net_out_display:>8} {net_in_display:>8} {net_total_display:>8} {disk_total_display:>8} {disk_current_display:>8} {conn_display:>5} {elapsed_str:>8} {dir_display}"
-            else:
-                row = f"  {instance.pid:>6} {instance.status:>8} {instance.cpu_percent:>6.1f} {instance.memory_mb:>8.1f} {net_out_display:>8} {net_in_display:>8} {net_total_display:>8} {disk_total_display:>8} {disk_current_display:>8} {conn_display:>5} {elapsed_str:>8} {dir_display}"
-            
-            self.stdscr.attron(color)
-            self.stdscr.addstr(y, 0, row[:width-1])
-            self.stdscr.attroff(color)
-            
-            if is_selected:
-                self.stdscr.attroff(curses.color_pair(5))
+        # Use filtered instances if search is active
+        instances_to_show = self.filtered_instances if self.search_mode or self.search_query else self.monitor.instances
+        
+        if self.monitor.group_by_project and not self.search_query:
+            # Grouped display mode
+            self.draw_grouped_instances(start_y, visible_lines, width)
+        else:
+            # Normal flat display
+            for idx, instance in enumerate(instances_to_show[:visible_lines]):
+                y = start_y + idx
+                is_selected = idx == self.monitor.selected_index
+                self.draw_instance_row(instance, y, 0, width, is_selected)
     
     def draw_footer(self):
         """Draw the footer with commands"""
         height, width = self.stdscr.getmaxyx()
         
+        # Search bar if in search mode
+        if self.search_mode:
+            self.stdscr.attron(curses.color_pair(4))
+            search_prompt = f"Search: {self.search_query}_"
+            self.stdscr.addstr(height-3, 2, search_prompt[:width-4])
+            self.stdscr.attroff(curses.color_pair(4))
         # Error message if any
-        if self.error_message:
+        elif self.error_message:
             self.stdscr.attron(curses.color_pair(3))
             self.stdscr.addstr(height-3, 2, self.error_message[:width-4])
             self.stdscr.attroff(curses.color_pair(3))
         
+        # Show filtered count if search is active
+        if self.search_query and not self.search_mode:
+            filter_info = f"[Filtered: {len(self.filtered_instances)}/{len(self.monitor.instances)}]"
+            self.stdscr.addstr(height-3, 2, filter_info)
+        
+        # Show multi-select info
+        if self.multi_select_mode:
+            select_info = f"[Multi-select: {len(self.selected_instances)} selected]"
+            self.stdscr.addstr(height-2, 2, select_info)
+        
         # Commands with database indicator
         db_status = " [DB]" if self.monitor.enable_database else ""
-        commands = f"q:Quit  p:Pause/Resume  K:Kill  s:Sort  f:Path  d:Stats  h:Help  ↑↓:Navigate{db_status}"
+        if self.multi_select_mode:
+            commands = f"Space:Select  a:All  n:None  p:Pause  K:Kill  ESC:Exit  ↑↓:Navigate{db_status}"
+        else:
+            commands = f"q:Quit  /:Search  m:Multi  g:Group  p:Pause  K:Kill  s:Sort  f:Path  h:Help{db_status}"
         self.stdscr.addstr(height-1, 2, commands[:width-4])
     
     def draw_help(self):
@@ -806,11 +927,25 @@ class ClaudeTopUI:
             "  ↑/↓ or j/k  - Move selection up/down",
             "  Home/End    - Go to first/last item",
             "",
+            "Search & Filter:",
+            "  /           - Enter search mode",
+            "  ESC         - Clear search/Exit search mode",
+            "  Search by: PID, status, command, or directory",
+            "",
+            "Multi-Select Mode:",
+            "  m           - Enter multi-select mode",
+            "  Space       - Toggle selection",
+            "  a           - Select all",
+            "  n           - Select none",
+            "  p           - Pause/Resume selected",
+            "  K           - Kill selected (with confirmation)",
+            "  ESC         - Exit multi-select mode",
+            "",
             "Actions:",
             "  p           - Pause/Resume selected instance",
             "  K           - Kill selected instance (with confirmation)",
             "  f           - Toggle full/short directory path",
-            "  Enter       - View detailed information",
+            "  g           - Group by project/workspace",
             "",
             "Sorting:",
             "  s           - Cycle: PID→CPU→Mem→Net↑→Net↓→NetΣ→DiskΣ→Disk∆→Conn→Time",
@@ -858,20 +993,96 @@ class ClaudeTopUI:
                 self.show_help = False
             return True
         
-        if key == ord('q') or key == 27:  # q or ESC
+        # Handle search mode input
+        if self.search_mode:
+            if key == 27:  # ESC - exit search
+                self.search_mode = False
+                if not self.search_query:
+                    self.filtered_instances = self.monitor.instances
+            elif key == ord('\n'):  # Enter - confirm search
+                self.search_mode = False
+                self.apply_search_filter()
+            elif key == curses.KEY_BACKSPACE or key == 127:
+                if self.search_query:
+                    self.search_query = self.search_query[:-1]
+                    self.apply_search_filter()
+            elif 32 <= key <= 126:  # Printable characters
+                self.search_query += chr(key)
+                self.apply_search_filter()
+            return True
+        
+        # Handle multi-select mode
+        if self.multi_select_mode:
+            instances = self.filtered_instances if self.search_query else self.monitor.instances
+            
+            if key == 27:  # ESC - exit multi-select
+                self.multi_select_mode = False
+                self.selected_instances.clear()
+            elif key == ord(' '):  # Space - toggle selection
+                if instances and self.monitor.selected_index < len(instances):
+                    pid = instances[self.monitor.selected_index].pid
+                    if pid in self.selected_instances:
+                        self.selected_instances.remove(pid)
+                    else:
+                        self.selected_instances.add(pid)
+            elif key == ord('a'):  # Select all
+                self.selected_instances = {inst.pid for inst in instances}
+            elif key == ord('n'):  # Select none
+                self.selected_instances.clear()
+            elif key == ord('p'):  # Batch pause/resume
+                if self.selected_instances:
+                    for pid in self.selected_instances:
+                        self.monitor.pause_resume_process(pid)
+                    self.selected_instances.clear()
+                    self.multi_select_mode = False
+            elif key == ord('K'):  # Batch kill
+                if self.selected_instances:
+                    if self.show_batch_kill_confirmation():
+                        self.selected_instances.clear()
+                        self.multi_select_mode = False
+            # Navigation in multi-select mode
+            elif key == curses.KEY_UP or key == ord('k'):
+                if self.monitor.selected_index > 0:
+                    self.monitor.selected_index -= 1
+            elif key == curses.KEY_DOWN or key == ord('j'):
+                if self.monitor.selected_index < len(instances) - 1:
+                    self.monitor.selected_index += 1
+            return True
+        
+        # Normal mode
+        if key == ord('q'):  # q to quit
             return False
+        elif key == 27:  # ESC - clear search
+            if self.search_query:
+                self.search_query = ""
+                self.filtered_instances = self.monitor.instances
+                self.apply_search_filter()
+            else:
+                return False
+        elif key == ord('/'):  # Enter search mode
+            self.search_mode = True
+            self.search_query = ""
+        elif key == ord('m'):  # Enter multi-select mode
+            self.multi_select_mode = True
+            self.selected_instances.clear()
+        elif key == ord('g'):  # Toggle group by project
+            self.monitor.group_by_project = not self.monitor.group_by_project
+            if self.monitor.group_by_project:
+                self.monitor.group_instances_by_project()
         elif key == ord('h'):
             self.show_help = True
         elif key == curses.KEY_UP or key == ord('k'):
             if self.monitor.selected_index > 0:
                 self.monitor.selected_index -= 1
         elif key == curses.KEY_DOWN or key == ord('j'):
-            if self.monitor.selected_index < len(self.monitor.instances) - 1:
+            instances = self.filtered_instances if self.search_query else self.monitor.instances
+            if self.monitor.selected_index < len(instances) - 1:
                 self.monitor.selected_index += 1
         elif key == ord('p'):
             # Pause/Resume selected instance
-            if self.monitor.instances:
-                instance = self.monitor.instances[self.monitor.selected_index]
+            instances = self.filtered_instances if self.search_query else self.monitor.instances
+            if instances and self.monitor.selected_index < len(instances):
+                instance = instances[self.monitor.selected_index]
                 error = self.monitor.pause_resume_process(instance.pid)
                 if error:
                     self.error_message = error
@@ -879,8 +1090,9 @@ class ClaudeTopUI:
                     self.error_message = ""
         elif key == ord('K'):  # Capital K for kill (to avoid accidental kills)
             # Kill selected instance with confirmation
-            if self.monitor.instances:
-                instance = self.monitor.instances[self.monitor.selected_index]
+            instances = self.filtered_instances if self.search_query else self.monitor.instances
+            if instances and self.monitor.selected_index < len(instances):
+                instance = instances[self.monitor.selected_index]
                 choice = self.show_kill_confirmation(instance)
                 
                 if choice == 'graceful':
@@ -1051,6 +1263,87 @@ class ClaudeTopUI:
             elif key == ord('f') or key == ord('F'):
                 return 'force'
     
+    def show_batch_kill_confirmation(self):
+        """Show batch kill confirmation dialog"""
+        height, width = self.stdscr.getmaxyx()
+        
+        instances = self.filtered_instances if self.search_query else self.monitor.instances
+        selected = [inst for inst in instances if inst.pid in self.selected_instances]
+        
+        dialog_text = [
+            f"Kill {len(selected)} Processes?",
+            "",
+            "Selected processes:",
+        ]
+        
+        # Show first few selected processes
+        for inst in selected[:5]:
+            dialog_text.append(f"  PID {inst.pid}: {inst.working_dir.split('/')[-1]}")
+        
+        if len(selected) > 5:
+            dialog_text.append(f"  ... and {len(selected) - 5} more")
+        
+        dialog_text.extend([
+            "",
+            "Choose action:",
+            "",
+            "  [C] Cancel",
+            "  [G] Kill All Gracefully (SIGTERM)",
+            "  [F] Kill All Now (SIGKILL)",
+            "",
+            "Press C, G, or F..."
+        ])
+        
+        # Calculate dialog dimensions
+        box_height = len(dialog_text) + 4
+        box_width = max(len(line) for line in dialog_text) + 6
+        start_y = (height - box_height) // 2
+        start_x = (width - box_width) // 2
+        
+        # Draw dialog box
+        self.stdscr.attron(curses.color_pair(3))  # Red/warning color
+        for y in range(box_height):
+            self.stdscr.addstr(start_y + y, start_x, " " * box_width)
+        
+        # Draw border
+        for y in range(box_height):
+            if y == 0 or y == box_height - 1:
+                self.stdscr.addstr(start_y + y, start_x, "─" * box_width)
+            else:
+                self.stdscr.addstr(start_y + y, start_x, "│")
+                self.stdscr.addstr(start_y + y, start_x + box_width - 1, "│")
+        
+        # Corner characters
+        self.stdscr.addstr(start_y, start_x, "┌")
+        self.stdscr.addstr(start_y, start_x + box_width - 1, "┐")
+        self.stdscr.addstr(start_y + box_height - 1, start_x, "└")
+        self.stdscr.addstr(start_y + box_height - 1, start_x + box_width - 1, "┘")
+        
+        # Draw dialog text
+        for i, line in enumerate(dialog_text):
+            self.stdscr.addstr(start_y + i + 2, start_x + 3, line)
+        
+        self.stdscr.attroff(curses.color_pair(3))
+        self.stdscr.refresh()
+        
+        # Wait for user choice
+        while True:
+            key = self.stdscr.getch()
+            if key == ord('c') or key == ord('C') or key == 27:  # Cancel or ESC
+                return False
+            elif key == ord('g') or key == ord('G'):
+                # Kill all gracefully
+                for pid in self.selected_instances:
+                    self.monitor.kill_process(pid, force=False)
+                self.error_message = f"Terminated {len(self.selected_instances)} processes gracefully"
+                return True
+            elif key == ord('f') or key == ord('F'):
+                # Kill all forcefully
+                for pid in self.selected_instances:
+                    self.monitor.kill_process(pid, force=True)
+                self.error_message = f"Killed {len(self.selected_instances)} processes forcefully"
+                return True
+    
     def run(self):
         """Main UI loop"""
         self.stdscr.nodelay(True)  # Non-blocking input
@@ -1066,15 +1359,30 @@ class ClaudeTopUI:
             if current_time - last_update > self.monitor.update_interval:
                 self.monitor.instances = self.monitor.find_claude_processes()
                 self.monitor.sort_instances()
+                
+                # Update grouping if enabled
+                if self.monitor.group_by_project:
+                    self.monitor.group_instances_by_project()
+                
+                # Apply search filter if active
+                if self.search_query:
+                    self.apply_search_filter()
+                else:
+                    self.filtered_instances = self.monitor.instances
+                
                 last_update = current_time
                 
                 # Clean up old CPU histories
                 current_pids = {inst.pid for inst in self.monitor.instances}
                 self.monitor.cpu_histories = {pid: hist for pid, hist in self.monitor.cpu_histories.items() if pid in current_pids}
                 
+                # Clean up selected instances for batch operations
+                self.selected_instances = {pid for pid in self.selected_instances if pid in current_pids}
+                
                 # Adjust selected index if needed
-                if self.monitor.selected_index >= len(self.monitor.instances):
-                    self.monitor.selected_index = max(0, len(self.monitor.instances) - 1)
+                instances = self.filtered_instances if self.search_query else self.monitor.instances
+                if self.monitor.selected_index >= len(instances):
+                    self.monitor.selected_index = max(0, len(instances) - 1)
             
             # Clear and redraw
             self.stdscr.clear()
