@@ -127,9 +127,9 @@ claude-top --interval 2.0
 - **▲/▼**: Sort direction indicator on column headers
 - **[DB]**: Database tracking enabled
 - **Color coding**:
-  - Green: Running processes
-  - Cyan: Waiting for user input
-  - Default: Idle processes
+  - Green: Running processes (actively processing)
+  - Cyan: Waiting (in conversation, waiting for user input)
+  - Default/White: Idle (between sessions, waiting for new instructions)
   - Yellow: Paused processes
   - Red: High resource usage (>80% CPU or >1GB memory)
 

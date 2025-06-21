@@ -139,7 +139,14 @@ class ClaudeMonitor:
             return None
     
     def determine_process_status(self, pid, proc):
-        """Determine process status based on CPU usage patterns"""
+        """Determine process status based on CPU usage patterns
+        
+        States:
+        - running: Actively processing (>5% CPU)
+        - waiting: In conversation, waiting for user input (<0.5% CPU, recent activity)
+        - idle: Between sessions, waiting for new instructions (<0.5% CPU, no recent activity)
+        - paused: Manually paused or system stopped
+        """
         # Check if manually paused
         if pid in self.paused_pids:
             return 'paused'
@@ -154,13 +161,32 @@ class ClaudeMonitor:
         if len(cpu_samples) >= 3:
             avg_cpu = sum(cpu_samples) / len(cpu_samples)
             max_cpu = max(cpu_samples)
+            recent_cpu = cpu_samples[-1] if cpu_samples else 0
             
-            if avg_cpu < 0.5 and max_cpu < 1.0:
-                return 'waiting'  # Waiting for user input
-            elif avg_cpu > 5.0:
+            # Check patterns in CPU history
+            recent_samples = cpu_samples[-3:] if len(cpu_samples) >= 3 else cpu_samples
+            recent_avg = sum(recent_samples) / len(recent_samples) if recent_samples else 0
+            
+            # Look for transition from active to idle (indicates waiting)
+            had_activity = any(sample > 3.0 for sample in cpu_samples[:-2]) if len(cpu_samples) > 2 else False
+            now_idle = recent_avg < 0.5
+            
+            if avg_cpu > 5.0:
                 return 'running'  # Actively processing
+            elif recent_avg < 0.5:
+                # Very low recent CPU
+                if had_activity and max_cpu > 3.0:
+                    # Had significant activity before becoming idle - waiting for input
+                    return 'waiting'
+                elif recent_cpu > 0.2 or any(s > 0.5 for s in recent_samples):
+                    # Still has minimal activity - likely waiting
+                    return 'waiting'
+                else:
+                    # No recent activity at all - idle between sessions
+                    return 'idle'
             else:
-                return 'idle'     # Minimal activity
+                # Medium CPU (0.5-5.0) - processing
+                return 'running'
         
         # Default to running for new processes
         return 'running'
