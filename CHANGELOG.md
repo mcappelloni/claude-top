@@ -5,6 +5,14 @@ All notable changes to claude-top will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+- Improved process state detection to properly distinguish between:
+  - "waiting": Claude is in an active conversation but waiting for user input
+  - "idle": Claude has finished all tasks and is waiting for new instructions
+- Enhanced CPU pattern analysis for more accurate state determination
+
 ## [0.0.1] - 2024-12-21
 
 ### Added
