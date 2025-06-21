@@ -17,6 +17,15 @@ from collections import deque
 import subprocess
 import argparse
 
+# Import database tracking components
+try:
+    from database_schema import ClaudeDatabase
+    from process_tree import ProcessTreeTracker
+    from analytics import ClaudeAnalytics
+    DATABASE_AVAILABLE = True
+except ImportError:
+    DATABASE_AVAILABLE = False
+
 @dataclass
 class ClaudeInstance:
     pid: int
@@ -39,7 +48,7 @@ class ClaudeInstance:
     mcp_connections: int = 0
 
 class ClaudeMonitor:
-    def __init__(self):
+    def __init__(self, enable_database: bool = True):
         self.instances: List[ClaudeInstance] = []
         self.selected_index = 0
         self.paused_pids = set()
@@ -48,6 +57,21 @@ class ClaudeMonitor:
         self.reverse_sort = False
         self.show_full_path = False
         self.cpu_histories = {}  # Track CPU history for each PID
+        
+        # Database tracking
+        self.enable_database = enable_database and DATABASE_AVAILABLE
+        self.db = None
+        self.tree_tracker = None
+        self.active_sessions = {}  # pid -> session_id
+        self.project_cache = {}    # working_dir -> project_id
+        
+        if self.enable_database:
+            try:
+                self.db = ClaudeDatabase()
+                self.tree_tracker = ProcessTreeTracker()
+            except Exception as e:
+                print(f"Warning: Database initialization failed: {e}")
+                self.enable_database = False
         
     def find_claude_processes(self):
         """Find all Claude CLI processes running on the system"""
@@ -73,8 +97,64 @@ class ClaudeMonitor:
                         claude_processes.append(instance)
             except (psutil.NoSuchProcess, psutil.AccessDenied):
                 continue
+        
+        # Database tracking
+        if self.enable_database and self.db:
+            self.track_processes_in_database(claude_processes)
                 
         return claude_processes
+    
+    def track_processes_in_database(self, instances: List[ClaudeInstance]):
+        """Track processes in database"""
+        try:
+            current_pids = {inst.pid for inst in instances}
+            
+            # End sessions for processes that are no longer running
+            ended_pids = set(self.active_sessions.keys()) - current_pids
+            for pid in ended_pids:
+                session_id = self.active_sessions[pid]
+                self.db.end_session(session_id)
+                del self.active_sessions[pid]
+            
+            # Start sessions for new processes and record metrics for all
+            for instance in instances:
+                if instance.pid not in self.active_sessions:
+                    # Start new session
+                    project_id = self.get_or_create_project(instance.working_dir)
+                    session_id = self.db.start_session(
+                        instance.pid, 
+                        project_id, 
+                        instance.command
+                    )
+                    self.active_sessions[instance.pid] = session_id
+                
+                # Record current metrics
+                session_id = self.active_sessions[instance.pid]
+                metrics = {
+                    'cpu_percent': instance.cpu_percent,
+                    'memory_mb': instance.memory_mb,
+                    'net_bytes_sent': instance.net_bytes_sent,
+                    'net_bytes_recv': instance.net_bytes_recv,
+                    'net_bytes_total': instance.net_bytes_total,
+                    'disk_total_bytes': instance.disk_total_bytes,
+                    'disk_current_bytes': instance.disk_current_bytes,
+                    'connections_count': instance.connections_count,
+                    'mcp_connections': instance.mcp_connections,
+                    'status': instance.status
+                }
+                self.db.record_metrics(session_id, metrics)
+        except Exception as e:
+            # Don't let database errors break the monitoring
+            pass
+    
+    def get_or_create_project(self, working_dir: str) -> int:
+        """Get or create project with caching"""
+        if working_dir in self.project_cache:
+            return self.project_cache[working_dir]
+        
+        project_id = self.db.get_or_create_project(working_dir)
+        self.project_cache[working_dir] = project_id
+        return project_id
     
     def parse_claude_process(self, proc) -> Optional[ClaudeInstance]:
         """Parse process information to create ClaudeInstance"""
@@ -569,6 +649,7 @@ class ClaudeTopUI:
             "",
             "Controls:",
             "  h           - Toggle this help",
+            "  d           - Show database statistics (if enabled)",
             "  q or Esc    - Quit",
             "",
             "Press any key to close help..."
@@ -633,8 +714,80 @@ class ClaudeTopUI:
             # Toggle full path display
             self.monitor.show_full_path = not self.monitor.show_full_path
             self.monitor.sort_instances()
+        elif key == ord('d') or key == ord('D'):
+            # Show database statistics
+            if self.monitor.enable_database and self.monitor.db:
+                self.show_database_stats()
+            else:
+                self.error_message = "Database tracking not enabled"
         
         return True
+    
+    def show_database_stats(self):
+        """Show database statistics overlay"""
+        height, width = self.stdscr.getmaxyx()
+        
+        try:
+            # Get analytics
+            analytics = ClaudeAnalytics(self.monitor.db.db_path)
+            reports = analytics.generate_usage_report(7)
+            active_sessions = self.monitor.db.get_active_sessions()
+            
+            stats_text = [
+                "Database Statistics (Last 7 Days)",
+                "",
+                f"Active Sessions: {len(active_sessions)}",
+                f"Total Projects: {len(reports)}",
+                "",
+                "Top Projects by Runtime:",
+            ]
+            
+            for i, report in enumerate(reports[:5], 1):
+                stats_text.append(f"  {i}. {report.project_name}: {report.total_runtime_hours:.1f}h")
+            
+            if reports:
+                stats_text.extend([
+                    "",
+                    "Current Session Summary:",
+                    f"  Avg CPU: {sum(r.avg_cpu_percent for r in reports)/len(reports):.1f}%",
+                    f"  Avg Memory: {sum(r.avg_memory_mb for r in reports)/len(reports):.1f}MB",
+                    f"  Total Network: {sum(r.total_network_bytes for r in reports)}B",
+                    f"  Total Disk: {sum(r.total_disk_bytes for r in reports)}B"
+                ])
+            
+            stats_text.extend([
+                "",
+                "Press any key to close..."
+            ])
+        except Exception as e:
+            stats_text = [
+                "Database Statistics",
+                "",
+                f"Error loading statistics: {str(e)}",
+                "",
+                "Press any key to close..."
+            ]
+        
+        # Calculate box dimensions
+        box_height = len(stats_text) + 4
+        box_width = max(len(line) for line in stats_text) + 6
+        start_y = (height - box_height) // 2
+        start_x = (width - box_width) // 2
+        
+        # Draw box
+        self.stdscr.attron(curses.color_pair(4))
+        for y in range(box_height):
+            self.stdscr.addstr(start_y + y, start_x, " " * box_width)
+        
+        # Draw stats text
+        for i, line in enumerate(stats_text):
+            self.stdscr.addstr(start_y + i + 2, start_x + 3, line)
+        self.stdscr.attroff(curses.color_pair(4))
+        
+        self.stdscr.refresh()
+        
+        # Wait for keypress
+        self.stdscr.getch()
     
     def run(self):
         """Main UI loop"""
@@ -681,13 +834,35 @@ class ClaudeTopUI:
 
 def main(stdscr):
     """Main entry point"""
+    # Access global args
+    enable_db = not global_args.no_database if 'global_args' in globals() else True
+    db_path = global_args.db_path if 'global_args' in globals() else "claude_tracking.db"
+    
+    # Create monitor with database options
+    monitor = ClaudeMonitor(enable_database=enable_db)
+    if enable_db and monitor.enable_database and monitor.db:
+        monitor.db.db_path = db_path
+    
     ui = ClaudeTopUI(stdscr)
-    ui.run()
+    ui.monitor = monitor  # Replace default monitor
+    
+    try:
+        ui.run()
+    finally:
+        # Graceful shutdown - end database sessions
+        if ui.monitor.enable_database and ui.monitor.db:
+            for pid, session_id in ui.monitor.active_sessions.items():
+                ui.monitor.db.end_session(session_id)
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Monitor Claude CLI instances")
+    parser = argparse.ArgumentParser(description="Monitor Claude CLI instances with SQLite tracking")
     parser.add_argument('--interval', type=float, default=1.0, help="Update interval in seconds")
+    parser.add_argument('--no-database', action='store_true', help="Disable database tracking")
+    parser.add_argument('--db-path', default="claude_tracking.db", help="Database file path")
     args = parser.parse_args()
+    
+    # Store args globally for access in main
+    global_args = args
     
     try:
         curses.wrapper(main)

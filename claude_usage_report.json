@@ -1,0 +1,276 @@
+{
+  "generated_at": "2025-06-21T14:50:09.811070",
+  "usage_report_7d": [
+    {
+      "project_name": "claude_exp",
+      "session_count": 6,
+      "total_runtime_hours": 0.08416666666666667,
+      "avg_cpu_percent": 1.2615384615384615,
+      "avg_memory_mb": 78.8954326923077,
+      "peak_memory_mb": 451.625,
+      "total_network_bytes": 4092,
+      "total_disk_bytes": 1916927,
+      "first_seen": "2025-06-21 14:48:09.669583",
+      "last_seen": "2025-06-21 12:48:22",
+      "subprocess_types": {
+        "Other": 30
+      }
+    },
+    {
+      "project_name": "claude-top",
+      "session_count": 4,
+      "total_runtime_hours": 0.06666666666666667,
+      "avg_cpu_percent": 3.1350000000000002,
+      "avg_memory_mb": 91.88203125,
+      "peak_memory_mb": 343.53125,
+      "total_network_bytes": 7164,
+      "total_disk_bytes": 689765,
+      "first_seen": "2025-06-21 14:48:09.698033",
+      "last_seen": "2025-06-21 12:48:22",
+      "subprocess_types": {
+        "Python": 30,
+        "Other": 5
+      }
+    },
+    {
+      "project_name": "react-aria-template",
+      "session_count": 1,
+      "total_runtime_hours": 0.016666666666666666,
+      "avg_cpu_percent": 22.18,
+      "avg_memory_mb": 497.809375,
+      "peak_memory_mb": 540.078125,
+      "total_network_bytes": 8188,
+      "total_disk_bytes": 11309874,
+      "first_seen": "2025-06-21 14:48:09.684890",
+      "last_seen": "2025-06-21 12:48:22",
+      "subprocess_types": {
+        "Other": 5
+      }
+    }
+  ],
+  "recent_sessions": [
+    {
+      "session_id": 11,
+      "pid": 29057,
+      "project_name": "claude-top",
+      "start_time": "2025-06-21 14:48:09.792988",
+      "end_time": "2025-06-21 12:48:22",
+      "duration_minutes": 0.2,
+      "avg_cpu": 3.4,
+      "avg_memory": 25.415625,
+      "max_memory": 27.78125,
+      "total_network": 0,
+      "total_disk": 689765,
+      "status_changes": [
+        "idle(3)",
+        "running(2)"
+      ]
+    },
+    {
+      "session_id": 10,
+      "pid": 29043,
+      "project_name": "claude-top",
+      "start_time": "2025-06-21 14:48:09.778701",
+      "end_time": "2025-06-21 12:48:22",
+      "duration_minutes": 0.2,
+      "avg_cpu": 0.0,
+      "avg_memory": 3.046875,
+      "max_memory": 3.046875,
+      "total_network": 0,
+      "total_disk": 0,
+      "status_changes": [
+        "waiting(3)",
+        "running(2)"
+      ]
+    },
+    {
+      "session_id": 9,
+      "pid": 28995,
+      "project_name": "claude_exp",
+      "start_time": "2025-06-21 14:48:09.767094",
+      "end_time": "2025-06-21 12:48:22",
+      "duration_minutes": 0.2,
+      "avg_cpu": 0.0,
+      "avg_memory": 1.25,
+      "max_memory": 1.25,
+      "total_network": 0,
+      "total_disk": 0,
+      "status_changes": [
+        "waiting(3)",
+        "running(2)"
+      ]
+    },
+    {
+      "session_id": 8,
+      "pid": 28992,
+      "project_name": "claude_exp",
+      "start_time": "2025-06-21 14:48:09.756778",
+      "end_time": "2025-06-21 12:48:22",
+      "duration_minutes": 0.2,
+      "avg_cpu": 0.0,
+      "avg_memory": 1.25,
+      "max_memory": 1.25,
+      "total_network": 0,
+      "total_disk": 0,
+      "status_changes": [
+        "waiting(3)",
+        "running(2)"
+      ]
+    },
+    {
+      "session_id": 7,
+      "pid": 28990,
+      "project_name": "claude_exp",
+      "start_time": "2025-06-21 14:48:09.745684",
+      "end_time": "2025-06-21 12:48:22",
+      "duration_minutes": 0.2,
+      "avg_cpu": 0.0,
+      "avg_memory": 1.25,
+      "max_memory": 1.25,
+      "total_network": 0,
+      "total_disk": 0,
+      "status_changes": [
+        "waiting(3)",
+        "running(2)"
+      ]
+    },
+    {
+      "session_id": 6,
+      "pid": 28988,
+      "project_name": "claude_exp",
+      "start_time": "2025-06-21 14:48:09.736096",
+      "end_time": "2025-06-21 12:48:22",
+      "duration_minutes": 0.2,
+      "avg_cpu": 0.0,
+      "avg_memory": 1.234375,
+      "max_memory": 1.234375,
+      "total_network": 0,
+      "total_disk": 0,
+      "status_changes": [
+        "waiting(3)",
+        "running(2)"
+      ]
+    },
+    {
+      "session_id": 5,
+      "pid": 28894,
+      "project_name": "claude_exp",
+      "start_time": "2025-06-21 14:48:09.721900",
+      "end_time": "2025-06-21 12:48:12",
+      "duration_minutes": 0.05,
+      "avg_cpu": 0.0,
+      "avg_memory": 2.703125,
+      "max_memory": 2.703125,
+      "total_network": 0,
+      "total_disk": 0,
+      "status_changes": [
+        "running(1)"
+      ]
+    },
+    {
+      "session_id": 4,
+      "pid": 28534,
+      "project_name": "claude-top",
+      "start_time": "2025-06-21 14:48:09.712304",
+      "end_time": "2025-06-21 12:48:22",
+      "duration_minutes": 0.2,
+      "avg_cpu": 2.44,
+      "avg_memory": 21.378125,
+      "max_memory": 21.40625,
+      "total_network": 0,
+      "total_disk": 6552,
+      "status_changes": [
+        "idle(3)",
+        "running(2)"
+      ]
+    },
+    {
+      "session_id": 3,
+      "pid": 23182,
+      "project_name": "claude-top",
+      "start_time": "2025-06-21 14:48:09.698033",
+      "end_time": "2025-06-21 12:48:22",
+      "duration_minutes": 0.2,
+      "avg_cpu": 6.7,
+      "avg_memory": 317.6875,
+      "max_memory": 343.53125,
+      "total_network": 7164,
+      "total_disk": 450560,
+      "status_changes": [
+        "running(3)",
+        "idle(2)"
+      ]
+    },
+    {
+      "session_id": 2,
+      "pid": 5478,
+      "project_name": "react-aria-template",
+      "start_time": "2025-06-21 14:48:09.684890",
+      "end_time": "2025-06-21 12:48:22",
+      "duration_minutes": 0.2,
+      "avg_cpu": 22.18,
+      "avg_memory": 497.809375,
+      "max_memory": 540.078125,
+      "total_network": 8188,
+      "total_disk": 11309874,
+      "status_changes": [
+        "running(5)"
+      ]
+    },
+    {
+      "session_id": 1,
+      "pid": 4033,
+      "project_name": "claude_exp",
+      "start_time": "2025-06-21 14:48:09.669583",
+      "end_time": "2025-06-21 12:48:22",
+      "duration_minutes": 0.2,
+      "avg_cpu": 6.56,
+      "avg_memory": 404.73125,
+      "max_memory": 451.625,
+      "total_network": 4092,
+      "total_disk": 1916927,
+      "status_changes": [
+        "running(5)"
+      ]
+    }
+  ],
+  "subprocess_analysis": {
+    "total_subprocesses": 70,
+    "unique_commands": 12,
+    "command_frequency": {
+      "/opt/homebrew/Cellar/python@3.13/3.13.4/Frameworks/Python.framework/Versions/3.13/Resources/Python.app/Contents/MacOS/Python claude_monitor_db.py": 15,
+      "claude   ": 10,
+      "/bin/zsh -c -l source /var/folders/nw/rfd9ks6j49lbdsyg17g_y7ph0000gp/T/claude-shell-snapshot-5b3e && eval 'source .venv/bin/activate && python claude_monitor_db.py' \\< /dev/null && pwd -P >| /var/folders/nw/rfd9ks6j49lbdsyg17g_y7ph0000gp/T/claude-9071-cwd": 10,
+      "tail -f /Users/matteo/Desktop/DEV/AI/claude_exp/real-builds/build_20250621_144807/logs/testing.log": 5,
+      "tail -f /Users/matteo/Desktop/DEV/AI/claude_exp/real-builds/build_20250621_144807/logs/planning.log": 5,
+      "tail -f /Users/matteo/Desktop/DEV/AI/claude_exp/real-builds/build_20250621_144807/logs/frontend.log": 5,
+      "tail -f /Users/matteo/Desktop/DEV/AI/claude_exp/real-builds/build_20250621_144807/logs/backend.log": 5,
+      "claude    ": 5,
+      "/opt/homebrew/Cellar/python@3.13/3.13.4/Frameworks/Python.framework/Versions/3.13/Resources/Python.app/Contents/MacOS/Python ./claude-top": 5,
+      "/bin/zsh -c -l source /var/folders/nw/rfd9ks6j49lbdsyg17g_y7ph0000gp/T/claude-shell-snapshot-3c2c && eval './real-parallel-orchestrate.sh demo' \\< /dev/null && pwd -P >| /var/folders/nw/rfd9ks6j49lbdsyg17g_y7ph0000gp/T/claude-503b-cwd": 2,
+      "/bin/bash ./real-parallel-orchestrate.sh demo": 2,
+      "sleep 5": 1
+    },
+    "resource_heavy": [
+      {
+        "command": "claude   ",
+        "frequency": 10,
+        "avg_cpu": 0.0,
+        "avg_memory": 451.4296875
+      },
+      {
+        "command": "claude    ",
+        "frequency": 5,
+        "avg_cpu": 0.0,
+        "avg_memory": 317.6875
+      }
+    ],
+    "categories": {
+      "Python": 30,
+      "Node.js": 0,
+      "System Tools": 0,
+      "Docker": 0,
+      "Other": 40
+    }
+  }
+}
