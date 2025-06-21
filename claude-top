@@ -30,6 +30,12 @@ class ClaudeInstance:
     memory_mb: float
     command: str
     cpu_history: deque = field(default_factory=lambda: deque(maxlen=5))
+    net_bytes_sent: int = 0
+    net_bytes_recv: int = 0
+    disk_read_bytes: int = 0
+    disk_write_bytes: int = 0
+    connections_count: int = 0
+    mcp_connections: int = 0
 
 class ClaudeMonitor:
     def __init__(self):
@@ -102,6 +108,9 @@ class ClaudeMonitor:
             # Determine status based on CPU usage patterns
             status = self.determine_process_status(pid, proc)
             
+            # Get network and disk I/O statistics
+            net_io, disk_io, connections_info = self.get_io_stats(proc)
+            
             return ClaudeInstance(
                 pid=pid,
                 working_dir=cwd,
@@ -113,7 +122,13 @@ class ClaudeMonitor:
                 cpu_percent=info.get('cpu_percent', 0.0),
                 memory_mb=info.get('memory_info').rss / 1024 / 1024 if info.get('memory_info') else 0,
                 command=cmdline,
-                cpu_history=self.cpu_histories[pid].copy()
+                cpu_history=self.cpu_histories[pid].copy(),
+                net_bytes_sent=net_io['bytes_sent'],
+                net_bytes_recv=net_io['bytes_recv'],
+                disk_read_bytes=disk_io['read_bytes'],
+                disk_write_bytes=disk_io['write_bytes'],
+                connections_count=connections_info['total_connections'],
+                mcp_connections=connections_info['mcp_connections']
             )
         except Exception:
             return None
@@ -138,6 +153,57 @@ class ClaudeMonitor:
         # Claude CLI does not expose token/context data in accessible files
         # This information is only available internally via /cost command
         return 0, 0
+    
+    def get_io_stats(self, proc):
+        """Get network I/O, disk I/O, and connection statistics for a process"""
+        try:
+            # Network I/O counters
+            try:
+                net_io = proc.net_io_counters()
+                net_stats = {
+                    'bytes_sent': net_io.bytes_sent if net_io else 0,
+                    'bytes_recv': net_io.bytes_recv if net_io else 0
+                }
+            except (psutil.NoSuchProcess, psutil.AccessDenied, AttributeError):
+                net_stats = {'bytes_sent': 0, 'bytes_recv': 0}
+            
+            # Disk I/O counters
+            try:
+                disk_io = proc.io_counters()
+                disk_stats = {
+                    'read_bytes': disk_io.read_bytes if disk_io else 0,
+                    'write_bytes': disk_io.write_bytes if disk_io else 0
+                }
+            except (psutil.NoSuchProcess, psutil.AccessDenied, AttributeError):
+                disk_stats = {'read_bytes': 0, 'write_bytes': 0}
+            
+            # Connection analysis
+            try:
+                connections = proc.net_connections()
+                total_connections = len(connections)
+                mcp_connections = 0
+                
+                for conn in connections:
+                    if conn.status == 'ESTABLISHED':
+                        # Heuristic for MCP: WebSocket-like ports or specific patterns
+                        if (conn.raddr and conn.raddr.port in [8000, 8080, 3000, 9000] or
+                            (conn.laddr and conn.laddr.port > 8000)):
+                            mcp_connections += 1
+                
+                connections_info = {
+                    'total_connections': total_connections,
+                    'mcp_connections': mcp_connections
+                }
+            except (psutil.NoSuchProcess, psutil.AccessDenied, AttributeError):
+                connections_info = {'total_connections': 0, 'mcp_connections': 0}
+            
+            return net_stats, disk_stats, connections_info
+            
+        except Exception:
+            # Return default values on any error
+            return ({'bytes_sent': 0, 'bytes_recv': 0}, 
+                   {'read_bytes': 0, 'write_bytes': 0},
+                   {'total_connections': 0, 'mcp_connections': 0})
     
     def pause_resume_process(self, pid: int):
         """Pause or resume a process"""
@@ -187,7 +253,12 @@ class ClaudeMonitor:
             self.instances.sort(key=lambda x: x.cpu_percent, reverse=self.reverse_sort)
         elif self.sort_key == 'memory':
             self.instances.sort(key=lambda x: x.memory_mb, reverse=self.reverse_sort)
-        # Removed token sorting - not available
+        elif self.sort_key == 'network':
+            self.instances.sort(key=lambda x: x.net_bytes_sent + x.net_bytes_recv, reverse=self.reverse_sort)
+        elif self.sort_key == 'disk':
+            self.instances.sort(key=lambda x: x.disk_read_bytes + x.disk_write_bytes, reverse=self.reverse_sort)
+        elif self.sort_key == 'connections':
+            self.instances.sort(key=lambda x: x.connections_count, reverse=self.reverse_sort)
         elif self.sort_key == 'time':
             self.instances.sort(key=lambda x: x.start_time, reverse=self.reverse_sort)
 
@@ -207,6 +278,19 @@ class ClaudeTopUI:
         curses.init_pair(3, curses.COLOR_RED, curses.COLOR_BLACK)  # High CPU/Memory
         curses.init_pair(4, curses.COLOR_CYAN, curses.COLOR_BLACK)  # Header
         curses.init_pair(5, curses.COLOR_WHITE, curses.COLOR_BLUE)  # Selected
+    
+    def format_bytes(self, bytes_value):
+        """Format bytes into human readable format"""
+        if bytes_value == 0:
+            return "0B"
+        elif bytes_value < 1024:
+            return f"{bytes_value}B"
+        elif bytes_value < 1024 * 1024:
+            return f"{bytes_value/1024:.1f}K"
+        elif bytes_value < 1024 * 1024 * 1024:
+            return f"{bytes_value/(1024*1024):.1f}M"
+        else:
+            return f"{bytes_value/(1024*1024*1024):.1f}G"
         
     def draw_header(self):
         """Draw the header with title and stats"""
@@ -238,12 +322,15 @@ class ClaudeTopUI:
             'time': 'Time'
         }
         
-        # Build headers with sort indicator - removed misleading Token/Context columns
+        # Build headers with sort indicator - added I/O columns
         headers_parts = [
             ('PID', 7, 'pid'),
-            ('Status', 10, None),
+            ('Status', 8, None),
             ('CPU%', 6, 'cpu'),
             ('Mem(MB)', 8, 'memory'),
+            ('Net↑↓', 8, 'network'),
+            ('Disk↑↓', 8, 'disk'),
+            ('Conn', 5, 'connections'),
             ('Time', 8, 'time'),
             ('Working Directory', 0, None)
         ]
@@ -314,11 +401,23 @@ class ClaudeTopUI:
                 else:
                     dir_display = instance.working_dir
             
-            # Build row with selection indicator - removed token/context columns
-            if is_selected:
-                row = f"→ {instance.pid:>6} {instance.status:>10} {instance.cpu_percent:>6.1f} {instance.memory_mb:>8.1f} {elapsed_str:>8} {dir_display}"
+            # Format I/O data
+            net_total = instance.net_bytes_sent + instance.net_bytes_recv
+            disk_total = instance.disk_read_bytes + instance.disk_write_bytes
+            net_display = self.format_bytes(net_total)
+            disk_display = self.format_bytes(disk_total)
+            
+            # Connection display with MCP indicator
+            if instance.mcp_connections > 0:
+                conn_display = f"{instance.connections_count}M"
             else:
-                row = f"  {instance.pid:>6} {instance.status:>10} {instance.cpu_percent:>6.1f} {instance.memory_mb:>8.1f} {elapsed_str:>8} {dir_display}"
+                conn_display = f"{instance.connections_count}"
+            
+            # Build row with selection indicator - added I/O columns
+            if is_selected:
+                row = f"→ {instance.pid:>6} {instance.status:>8} {instance.cpu_percent:>6.1f} {instance.memory_mb:>8.1f} {net_display:>8} {disk_display:>8} {conn_display:>5} {elapsed_str:>8} {dir_display}"
+            else:
+                row = f"  {instance.pid:>6} {instance.status:>8} {instance.cpu_percent:>6.1f} {instance.memory_mb:>8.1f} {net_display:>8} {disk_display:>8} {conn_display:>5} {elapsed_str:>8} {dir_display}"
             
             self.stdscr.attron(color)
             self.stdscr.addstr(y, 0, row[:width-1])
@@ -358,10 +457,15 @@ class ClaudeTopUI:
             "  Enter       - View detailed information",
             "",
             "Sorting:",
-            "  s           - Cycle through sort options",
+            "  s           - Cycle: PID→CPU→Memory→Network→Disk→Connections→Time",
             "  r           - Reverse sort order",
             "",
-            "Display:",
+            "Display Columns:",
+            "  Net↑↓       - Total network I/O (sent + received)",
+            "  Disk↑↓      - Total disk I/O (read + write)",
+            "  Conn        - Network connections (M = MCP detected)",
+            "",
+            "Controls:",
             "  h           - Toggle this help",
             "  q or Esc    - Quit",
             "",
@@ -414,8 +518,8 @@ class ClaudeTopUI:
                 else:
                     self.error_message = ""
         elif key == ord('s'):
-            # Cycle through sort options - removed tokens
-            sort_options = ['pid', 'cpu', 'memory', 'time']
+            # Cycle through sort options - added I/O columns
+            sort_options = ['pid', 'cpu', 'memory', 'network', 'disk', 'connections', 'time']
             current_idx = sort_options.index(self.monitor.sort_key)
             self.monitor.sort_key = sort_options[(current_idx + 1) % len(sort_options)]
             self.monitor.sort_instances()

@@ -20,6 +20,12 @@ class ClaudeInstance:
     memory_mb: float
     command: str
     cpu_history: deque = field(default_factory=lambda: deque(maxlen=5))
+    net_bytes_sent: int = 0
+    net_bytes_recv: int = 0
+    disk_read_bytes: int = 0
+    disk_write_bytes: int = 0
+    connections_count: int = 0
+    mcp_connections: int = 0
 
 class ClaudeMonitor:
     def __init__(self):
@@ -92,6 +98,9 @@ class ClaudeMonitor:
             # Determine status based on CPU usage patterns
             status = self.determine_process_status(pid, proc)
             
+            # Get network and disk I/O statistics
+            net_io, disk_io, connections_info = self.get_io_stats(proc)
+            
             return ClaudeInstance(
                 pid=pid,
                 working_dir=cwd,
@@ -103,7 +112,13 @@ class ClaudeMonitor:
                 cpu_percent=info.get('cpu_percent', 0.0),
                 memory_mb=info.get('memory_info').rss / 1024 / 1024 if info.get('memory_info') else 0,
                 command=cmdline,
-                cpu_history=self.cpu_histories[pid].copy()
+                cpu_history=self.cpu_histories[pid].copy(),
+                net_bytes_sent=net_io['bytes_sent'],
+                net_bytes_recv=net_io['bytes_recv'],
+                disk_read_bytes=disk_io['read_bytes'],
+                disk_write_bytes=disk_io['write_bytes'],
+                connections_count=connections_info['total_connections'],
+                mcp_connections=connections_info['mcp_connections']
             )
         except Exception:
             return None
@@ -140,3 +155,54 @@ class ClaudeMonitor:
         # Claude CLI does not expose token/context data in accessible files
         # This information is only available internally via /cost command
         return 0, 0
+    
+    def get_io_stats(self, proc):
+        """Get network I/O, disk I/O, and connection statistics for a process"""
+        try:
+            # Network I/O counters
+            try:
+                net_io = proc.net_io_counters()
+                net_stats = {
+                    'bytes_sent': net_io.bytes_sent if net_io else 0,
+                    'bytes_recv': net_io.bytes_recv if net_io else 0
+                }
+            except (psutil.NoSuchProcess, psutil.AccessDenied, AttributeError):
+                net_stats = {'bytes_sent': 0, 'bytes_recv': 0}
+            
+            # Disk I/O counters
+            try:
+                disk_io = proc.io_counters()
+                disk_stats = {
+                    'read_bytes': disk_io.read_bytes if disk_io else 0,
+                    'write_bytes': disk_io.write_bytes if disk_io else 0
+                }
+            except (psutil.NoSuchProcess, psutil.AccessDenied, AttributeError):
+                disk_stats = {'read_bytes': 0, 'write_bytes': 0}
+            
+            # Connection analysis
+            try:
+                connections = proc.net_connections()
+                total_connections = len(connections)
+                mcp_connections = 0
+                
+                for conn in connections:
+                    if conn.status == 'ESTABLISHED':
+                        # Heuristic for MCP: WebSocket-like ports or specific patterns
+                        if (conn.raddr and conn.raddr.port in [8000, 8080, 3000, 9000] or
+                            (conn.laddr and conn.laddr.port > 8000)):
+                            mcp_connections += 1
+                
+                connections_info = {
+                    'total_connections': total_connections,
+                    'mcp_connections': mcp_connections
+                }
+            except (psutil.NoSuchProcess, psutil.AccessDenied, AttributeError):
+                connections_info = {'total_connections': 0, 'mcp_connections': 0}
+            
+            return net_stats, disk_stats, connections_info
+            
+        except Exception:
+            # Return default values on any error
+            return ({'bytes_sent': 0, 'bytes_recv': 0}, 
+                   {'read_bytes': 0, 'write_bytes': 0},
+                   {'total_connections': 0, 'mcp_connections': 0})
