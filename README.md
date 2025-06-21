@@ -48,7 +48,7 @@ npx claude-top
 
 ```bash
 # Clone the repository
-git clone https://github.com/yourusername/claude-top.git
+git clone https://github.com/mcappelloni/claude-top.git
 cd claude-top
 
 # For npm/yarn users

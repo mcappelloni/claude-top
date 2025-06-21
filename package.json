@@ -1,6 +1,6 @@
 {
   "name": "claude-top",
-  "version": "1.0.0",
+  "version": "0.0.1",
   "description": "A terminal-based monitoring tool for Claude CLI instances, similar to htop but for Claude processes",
   "main": "index.js",
   "bin": {
@@ -19,7 +19,7 @@
     "process-monitor",
     "anthropic"
   ],
-  "author": "",
+  "author": "Matteo Cappelloni",
   "license": "MIT",
   "dependencies": {
     "node-pty": "^1.0.0",
@@ -32,10 +32,10 @@
   "preferGlobal": true,
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/yourusername/claude-top.git"
+    "url": "git+https://github.com/mcappelloni/claude-top.git"
   },
   "bugs": {
-    "url": "https://github.com/yourusername/claude-top/issues"
+    "url": "https://github.com/mcappelloni/claude-top/issues"
   },
-  "homepage": "https://github.com/yourusername/claude-top#readme"
+  "homepage": "https://github.com/mcappelloni/claude-top#readme"
 }
