@@ -476,6 +476,27 @@ class ClaudeMonitor:
         except Exception as e:
             return f"Error: {str(e)}"
         return None
+
+    def kill_process(self, pid: int, force=False):
+        """Kill a process gracefully (SIGTERM) or forcefully (SIGKILL)"""
+        try:
+            proc = psutil.Process(pid)
+            
+            if force:
+                # Force kill with SIGKILL
+                proc.kill()
+                return None, "Process killed forcefully (SIGKILL)"
+            else:
+                # Graceful termination with SIGTERM
+                proc.terminate()
+                return None, "Process terminated gracefully (SIGTERM)"
+                
+        except psutil.NoSuchProcess:
+            return f"Process {pid} no longer exists", None
+        except psutil.AccessDenied:
+            return f"Access denied to process {pid}", None
+        except Exception as e:
+            return f"Error killing process {pid}: {str(e)}", None
     
     def determine_process_status(self, pid, proc):
         """Determine process status based on CPU usage patterns"""
@@ -746,7 +767,7 @@ class ClaudeTopUI:
         
         # Commands with database indicator
         db_status = " [DB]" if self.monitor.enable_database else ""
-        commands = f"q:Quit  p:Pause/Resume  k:Kill  s:Sort  f:Path  d:Stats  h:Help  ↑↓:Navigate{db_status}"
+        commands = f"q:Quit  p:Pause/Resume  K:Kill  s:Sort  f:Path  d:Stats  h:Help  ↑↓:Navigate{db_status}"
         self.stdscr.addstr(height-1, 2, commands[:width-4])
     
     def draw_help(self):
@@ -761,7 +782,7 @@ class ClaudeTopUI:
             "",
             "Actions:",
             "  p           - Pause/Resume selected instance",
-            "  k           - Kill selected instance",
+            "  K           - Kill selected instance (with confirmation)",
             "  f           - Toggle full/short directory path",
             "  Enter       - View detailed information",
             "",
@@ -830,6 +851,25 @@ class ClaudeTopUI:
                     self.error_message = error
                 else:
                     self.error_message = ""
+        elif key == ord('K'):  # Capital K for kill (to avoid accidental kills)
+            # Kill selected instance with confirmation
+            if self.monitor.instances:
+                instance = self.monitor.instances[self.monitor.selected_index]
+                choice = self.show_kill_confirmation(instance)
+                
+                if choice == 'graceful':
+                    error, message = self.monitor.kill_process(instance.pid, force=False)
+                    if error:
+                        self.error_message = error
+                    else:
+                        self.error_message = message or "Process terminated"
+                elif choice == 'force':
+                    error, message = self.monitor.kill_process(instance.pid, force=True)
+                    if error:
+                        self.error_message = error
+                    else:
+                        self.error_message = message or "Process killed"
+                # If choice is None (cancel), do nothing
         elif key == ord('s'):
             # Cycle through sort options - split I/O columns
             sort_options = ['pid', 'cpu', 'memory', 'net_out', 'net_in', 'net_total', 'disk_total', 'disk_current', 'connections', 'time']
@@ -918,6 +958,72 @@ class ClaudeTopUI:
         
         # Wait for keypress
         self.stdscr.getch()
+
+    def show_kill_confirmation(self, instance):
+        """Show kill confirmation dialog with three options"""
+        height, width = self.stdscr.getmaxyx()
+        
+        dialog_text = [
+            f"Kill Process {instance.pid}?",
+            "",
+            f"Process: {instance.working_dir.split('/')[-1]}",
+            f"Command: {instance.command[:50]}...",
+            f"Status: {instance.status}",
+            f"CPU: {instance.cpu_percent:.1f}%",
+            f"Memory: {instance.memory_mb:.1f}MB",
+            "",
+            "Choose action:",
+            "",
+            "  [C] Cancel",
+            "  [G] Kill Gracefully (SIGTERM)",
+            "  [F] Kill Now (SIGKILL)",
+            "",
+            "Press C, G, or F..."
+        ]
+        
+        # Calculate dialog dimensions
+        box_height = len(dialog_text) + 4
+        box_width = max(len(line) for line in dialog_text) + 6
+        start_y = (height - box_height) // 2
+        start_x = (width - box_width) // 2
+        
+        # Draw dialog box background
+        self.stdscr.attron(curses.color_pair(3))  # Red/warning color
+        for y in range(box_height):
+            self.stdscr.addstr(start_y + y, start_x, " " * box_width)
+        
+        # Draw border
+        for y in range(box_height):
+            if y == 0 or y == box_height - 1:
+                # Top and bottom border
+                self.stdscr.addstr(start_y + y, start_x, "─" * box_width)
+            else:
+                # Side borders
+                self.stdscr.addstr(start_y + y, start_x, "│")
+                self.stdscr.addstr(start_y + y, start_x + box_width - 1, "│")
+        
+        # Corner characters
+        self.stdscr.addstr(start_y, start_x, "┌")
+        self.stdscr.addstr(start_y, start_x + box_width - 1, "┐")
+        self.stdscr.addstr(start_y + box_height - 1, start_x, "└")
+        self.stdscr.addstr(start_y + box_height - 1, start_x + box_width - 1, "┘")
+        
+        # Draw dialog text
+        for i, line in enumerate(dialog_text):
+            self.stdscr.addstr(start_y + i + 2, start_x + 3, line)
+        
+        self.stdscr.attroff(curses.color_pair(3))
+        self.stdscr.refresh()
+        
+        # Wait for user choice
+        while True:
+            key = self.stdscr.getch()
+            if key == ord('c') or key == ord('C') or key == 27:  # Cancel or ESC
+                return None
+            elif key == ord('g') or key == ord('G'):
+                return 'graceful'
+            elif key == ord('f') or key == ord('F'):
+                return 'force'
     
     def run(self):
         """Main UI loop"""

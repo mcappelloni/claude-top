@@ -2,6 +2,8 @@
 """Core Claude monitoring logic extracted for testing"""
 
 import psutil
+import signal
+import os
 from dataclasses import dataclass, field
 from datetime import datetime
 from collections import deque
@@ -42,17 +44,28 @@ class ClaudeMonitor:
     def find_claude_processes(self):
         """Find all Claude CLI processes running on the system"""
         claude_processes = []
+        current_pid = os.getpid()  # Get current process PID
         
         for proc in psutil.process_iter(['pid', 'name', 'cmdline', 'cwd', 'create_time', 'cpu_percent', 'memory_info']):
             try:
+                # Skip our own process
+                if proc.info['pid'] == current_pid:
+                    continue
+                
                 # Check if this is a Claude CLI process
                 cmdline = proc.info.get('cmdline', [])
                 if cmdline and any('claude' in cmd.lower() for cmd in cmdline):
                     # Filter out non-CLI Claude processes
                     cmdline_str = ' '.join(cmdline)
+                    
                     # Skip Claude desktop app processes
                     if 'Claude.app' in cmdline_str or 'Claude Helper' in cmdline_str or 'chrome_crashpad' in cmdline_str or 'Squirrel' in cmdline_str:
                         continue
+                        
+                    # Skip claude-top itself (additional check by command)
+                    if 'claude-top' in cmdline_str or './claude-top' in cmdline_str:
+                        continue
+                        
                     # Skip docker processes unless they're Claude-related containers
                     if 'docker' in cmdline_str and 'mcp/filesystem' in cmdline_str:
                         continue
@@ -361,3 +374,58 @@ class ClaudeMonitor:
             return mcp_count
         except (psutil.AccessDenied, AttributeError):
             return 0
+
+    def pause_resume_process(self, pid: int):
+        """Pause or resume a process"""
+        try:
+            if pid in self.paused_pids:
+                os.kill(pid, signal.SIGCONT)
+                self.paused_pids.remove(pid)
+            else:
+                os.kill(pid, signal.SIGSTOP)
+                self.paused_pids.add(pid)
+        except Exception as e:
+            return f"Error: {str(e)}"
+        return None
+
+    def kill_process(self, pid: int, force=False):
+        """Kill a process gracefully (SIGTERM) or forcefully (SIGKILL)"""
+        try:
+            proc = psutil.Process(pid)
+            
+            if force:
+                # Force kill with SIGKILL
+                proc.kill()
+                return None, "Process killed forcefully (SIGKILL)"
+            else:
+                # Graceful termination with SIGTERM
+                proc.terminate()
+                return None, "Process terminated gracefully (SIGTERM)"
+                
+        except psutil.NoSuchProcess:
+            return f"Process {pid} no longer exists", None
+        except psutil.AccessDenied:
+            return f"Access denied to process {pid}", None
+        except Exception as e:
+            return f"Error killing process {pid}: {str(e)}", None
+
+    def sort_instances(self):
+        """Sort instances based on current sort key"""
+        if not self.instances:
+            return
+        
+        sort_map = {
+            'pid': lambda x: x.pid,
+            'cpu': lambda x: x.cpu_percent,
+            'memory': lambda x: x.memory_mb,
+            'net_out': lambda x: x.net_bytes_sent,
+            'net_in': lambda x: x.net_bytes_recv,
+            'net_total': lambda x: x.net_bytes_total,
+            'disk_total': lambda x: x.disk_total_bytes,
+            'disk_current': lambda x: x.disk_current_bytes,
+            'connections': lambda x: x.connections_count,
+            'time': lambda x: x.start_time
+        }
+        
+        if self.sort_key in sort_map:
+            self.instances.sort(key=sort_map[self.sort_key], reverse=self.reverse_sort)
