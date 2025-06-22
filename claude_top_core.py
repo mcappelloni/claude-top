@@ -41,6 +41,13 @@ class ClaudeMonitor:
         self.show_full_path = False
         self.cpu_histories = {}  # Track CPU history for each PID
         
+        # Alert configuration
+        self.alerts_enabled = True
+        self.cpu_threshold = 80.0  # Alert when CPU > 80%
+        self.memory_threshold = 1000.0  # Alert when memory > 1GB
+        self.alert_history = {}  # pid -> {'cpu': timestamp, 'memory': timestamp}
+        self.alert_cooldown = 60  # Don't repeat same alert for 60 seconds
+        
     def find_claude_processes(self):
         """Find all Claude CLI processes running on the system"""
         claude_processes = []
@@ -192,7 +199,15 @@ class ClaudeMonitor:
         return 'running'
     
     def get_claude_metrics(self, pid: int, working_dir: str) -> tuple:
-        """Get context length and token usage from Claude's state files"""
+        """Get context length and token usage from Claude's state files
+        
+        Note: Token/cost tracking integration investigation completed.
+        Claude CLI intentionally does not expose internal usage data for security reasons.
+        The /cost command is internal-only and not accessible programmatically.
+        
+        Instead, claude-top focuses on process monitoring, resource tracking,
+        and session analytics which provide valuable productivity insights.
+        """
         # Claude CLI does not expose token/context data in accessible files
         # This information is only available internally via /cost command
         return 0, 0
@@ -455,3 +470,51 @@ class ClaudeMonitor:
         
         if self.sort_key in sort_map:
             self.instances.sort(key=sort_map[self.sort_key], reverse=self.reverse_sort)
+    
+    def check_resource_alerts(self):
+        """Check for processes exceeding resource thresholds"""
+        if not self.alerts_enabled:
+            return []
+        
+        import time
+        alerts = []
+        current_time = time.time()
+        
+        for instance in self.instances:
+            pid = instance.pid
+            
+            # Initialize alert history for new processes
+            if pid not in self.alert_history:
+                self.alert_history[pid] = {'cpu': 0, 'memory': 0}
+            
+            # Check CPU threshold
+            if instance.cpu_percent > self.cpu_threshold:
+                last_alert = self.alert_history[pid]['cpu']
+                if current_time - last_alert > self.alert_cooldown:
+                    alerts.append({
+                        'type': 'cpu',
+                        'pid': pid,
+                        'process': instance.working_dir.split('/')[-1],
+                        'value': instance.cpu_percent,
+                        'threshold': self.cpu_threshold
+                    })
+                    self.alert_history[pid]['cpu'] = current_time
+            
+            # Check memory threshold
+            if instance.memory_mb > self.memory_threshold:
+                last_alert = self.alert_history[pid]['memory']
+                if current_time - last_alert > self.alert_cooldown:
+                    alerts.append({
+                        'type': 'memory',
+                        'pid': pid,
+                        'process': instance.working_dir.split('/')[-1],
+                        'value': instance.memory_mb,
+                        'threshold': self.memory_threshold
+                    })
+                    self.alert_history[pid]['memory'] = current_time
+        
+        # Clean up alert history for dead processes
+        active_pids = {inst.pid for inst in self.instances}
+        self.alert_history = {pid: hist for pid, hist in self.alert_history.items() if pid in active_pids}
+        
+        return alerts
