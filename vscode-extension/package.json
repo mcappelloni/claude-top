@@ -1,0 +1,90 @@
+{
+  "name": "claude-top",
+  "displayName": "Claude Top Monitor",
+  "description": "Monitor Claude CLI instances directly from VS Code",
+  "version": "0.1.0",
+  "publisher": "claude-top",
+  "engines": {
+    "vscode": "^1.60.0"
+  },
+  "categories": ["Other"],
+  "activationEvents": [
+    "onCommand:claudeTop.showPanel",
+    "onCommand:claudeTop.refresh",
+    "onCommand:claudeTop.pauseInstance",
+    "onCommand:claudeTop.killInstance"
+  ],
+  "main": "./extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "claudeTop.showPanel",
+        "title": "Claude Top: Show Monitor Panel"
+      },
+      {
+        "command": "claudeTop.refresh",
+        "title": "Claude Top: Refresh"
+      },
+      {
+        "command": "claudeTop.pauseInstance",
+        "title": "Claude Top: Pause Instance"
+      },
+      {
+        "command": "claudeTop.killInstance",
+        "title": "Claude Top: Kill Instance"
+      }
+    ],
+    "views": {
+      "explorer": [
+        {
+          "id": "claudeTopView",
+          "name": "Claude Instances",
+          "icon": "$(pulse)"
+        }
+      ]
+    },
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "claude-top",
+          "title": "Claude Top",
+          "icon": "resources/icon.svg"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "Claude Top",
+      "properties": {
+        "claudeTop.updateInterval": {
+          "type": "number",
+          "default": 2,
+          "description": "Update interval in seconds"
+        },
+        "claudeTop.showNotifications": {
+          "type": "boolean",
+          "default": true,
+          "description": "Show notifications for high CPU/memory usage"
+        },
+        "claudeTop.cpuThreshold": {
+          "type": "number",
+          "default": 80,
+          "description": "CPU usage threshold for notifications (%)"
+        },
+        "claudeTop.memoryThreshold": {
+          "type": "number",
+          "default": 1000,
+          "description": "Memory usage threshold for notifications (MB)"
+        }
+      }
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./"
+  },
+  "devDependencies": {
+    "@types/vscode": "^1.60.0",
+    "@types/node": "^16.x"
+  }
+}

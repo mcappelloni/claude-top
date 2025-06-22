@@ -8,6 +8,7 @@ import json
 import os
 import psutil
 import signal
+import sys
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -22,6 +23,13 @@ try:
     from database_schema import ClaudeDatabase
     from process_tree import ProcessTreeTracker
     from analytics import ClaudeAnalytics
+    from historical_analytics import HistoricalAnalytics
+    from data_export import DataExporter
+    from productivity_metrics import ProductivityAnalyzer
+    from process_management import ProcessManager
+    from realtime_dashboard import RealTimeDashboard, RealTimeMetrics
+    from visual_indicators import VisualIndicators, IndicatorStyle
+    from performance_optimizer import PerformanceOptimizer
     DATABASE_AVAILABLE = True
 except ImportError:
     DATABASE_AVAILABLE = False
@@ -60,6 +68,13 @@ class ClaudeMonitor:
         self.group_by_project = False
         self.project_groups = {}  # project_path -> list of instances
         
+        # Alert configuration
+        self.alerts_enabled = True
+        self.cpu_threshold = 80.0  # Alert when CPU > 80%
+        self.memory_threshold = 1000.0  # Alert when memory > 1GB
+        self.alert_history = {}  # pid -> {'cpu': timestamp, 'memory': timestamp}
+        self.alert_cooldown = 60  # Don't repeat same alert for 60 seconds
+        
         # Database tracking
         self.enable_database = enable_database and DATABASE_AVAILABLE
         self.db = None
@@ -88,26 +103,48 @@ class ClaudeMonitor:
                 
                 # Check if this is a Claude CLI process
                 cmdline = proc.info.get('cmdline', [])
-                if cmdline and any('claude' in cmd.lower() for cmd in cmdline):
-                    # Filter out non-CLI Claude processes
-                    cmdline_str = ' '.join(cmdline)
-                    
-                    # Skip Claude desktop app processes
-                    if 'Claude.app' in cmdline_str or 'Claude Helper' in cmdline_str or 'chrome_crashpad' in cmdline_str or 'Squirrel' in cmdline_str:
-                        continue
-                    
-                    # Skip claude-top itself (additional check by command)
-                    if 'claude-top' in cmdline_str or './claude-top' in cmdline_str:
-                        continue
-                    
-                    # Skip docker processes unless they're Claude-related containers
-                    if 'docker' in cmdline_str and 'mcp/filesystem' in cmdline_str:
-                        continue
-                    
-                    # Extract relevant information
-                    instance = self.parse_claude_process(proc)
-                    if instance:
-                        claude_processes.append(instance)
+                if not cmdline:
+                    continue
+                
+                # More specific Claude CLI detection
+                # Look for actual claude command as the first argument or 'claude' executable
+                is_claude_cli = False
+                
+                # Check if first argument is 'claude' (the CLI command)
+                if cmdline[0] == 'claude' or cmdline[0].endswith('/claude'):
+                    is_claude_cli = True
+                
+                # Check for common patterns of Claude CLI execution
+                elif len(cmdline) >= 2:
+                    # Check for: python/python3 claude, npm/node claude, etc.
+                    if cmdline[1] == 'claude' or cmdline[1].endswith('/claude'):
+                        is_claude_cli = True
+                    # Check for: npm view @anthropic-ai/claude-code
+                    elif 'npm' in cmdline[0] and len(cmdline) > 2 and '@anthropic-ai/claude-code' in cmdline:
+                        is_claude_cli = True
+                    # Check for: npx claude
+                    elif cmdline[0].endswith('npx') and cmdline[1] == 'claude':
+                        is_claude_cli = True
+                
+                # Additional check for Claude CLI installed via npm/yarn globally
+                # e.g., /usr/local/bin/node /usr/local/lib/node_modules/@anthropic-ai/claude-code/bin/claude
+                if not is_claude_cli and len(cmdline) >= 2:
+                    if '@anthropic-ai/claude-code' in cmdline[1] and cmdline[1].endswith('/claude'):
+                        is_claude_cli = True
+                
+                if not is_claude_cli:
+                    continue
+                
+                cmdline_str = ' '.join(cmdline)
+                
+                # Skip claude-top itself (additional check by command)
+                if 'claude-top' in cmdline_str or './claude-top' in cmdline_str:
+                    continue
+                
+                # Extract relevant information
+                instance = self.parse_claude_process(proc)
+                if instance:
+                    claude_processes.append(instance)
             except (psutil.NoSuchProcess, psutil.AccessDenied):
                 continue
         
@@ -596,12 +633,58 @@ class ClaudeMonitor:
             elif self.sort_key == 'memory':
                 instances.sort(key=lambda x: x.memory_mb, reverse=self.reverse_sort)
             # ... other sort options
+    
+    def check_resource_alerts(self):
+        """Check for processes exceeding resource thresholds"""
+        if not self.alerts_enabled:
+            return []
+        
+        alerts = []
+        current_time = time.time()
+        
+        for instance in self.instances:
+            pid = instance.pid
+            
+            # Initialize alert history for new processes
+            if pid not in self.alert_history:
+                self.alert_history[pid] = {'cpu': 0, 'memory': 0}
+            
+            # Check CPU threshold
+            if instance.cpu_percent > self.cpu_threshold:
+                last_alert = self.alert_history[pid]['cpu']
+                if current_time - last_alert > self.alert_cooldown:
+                    alerts.append({
+                        'type': 'cpu',
+                        'pid': pid,
+                        'process': instance.working_dir.split('/')[-1],
+                        'value': instance.cpu_percent,
+                        'threshold': self.cpu_threshold
+                    })
+                    self.alert_history[pid]['cpu'] = current_time
+            
+            # Check memory threshold
+            if instance.memory_mb > self.memory_threshold:
+                last_alert = self.alert_history[pid]['memory']
+                if current_time - last_alert > self.alert_cooldown:
+                    alerts.append({
+                        'type': 'memory',
+                        'pid': pid,
+                        'process': instance.working_dir.split('/')[-1],
+                        'value': instance.memory_mb,
+                        'threshold': self.memory_threshold
+                    })
+                    self.alert_history[pid]['memory'] = current_time
+        
+        # Clean up alert history for dead processes
+        active_pids = {inst.pid for inst in self.instances}
+        self.alert_history = {pid: hist for pid, hist in self.alert_history.items() if pid in active_pids}
+        
+        return alerts
 
 class ClaudeTopUI:
     def __init__(self, stdscr):
         self.stdscr = stdscr
         self.monitor = ClaudeMonitor()
-        self.setup_colors()
         self.error_message = ""
         self.show_help = False
         self.search_mode = False
@@ -609,6 +692,35 @@ class ClaudeTopUI:
         self.filtered_instances = []
         self.selected_instances = set()  # For batch operations
         self.multi_select_mode = False
+        self.active_alerts = []  # Current alerts
+        self.show_alert_config = False  # Show alert configuration dialog
+        
+        # Analytics dashboard
+        self.show_analytics = False
+        self.analytics = HistoricalAnalytics() if DATABASE_AVAILABLE else None
+        self.analytics_view = "overview"  # overview, trends, projects, productivity, sessions
+        self.exporter = DataExporter() if DATABASE_AVAILABLE else None
+        self.productivity = ProductivityAnalyzer() if DATABASE_AVAILABLE else None
+        
+        # Process management
+        self.process_manager = ProcessManager() if DATABASE_AVAILABLE else None
+        
+        # Real-time dashboard
+        self.realtime_dashboard = RealTimeDashboard() if DATABASE_AVAILABLE else None
+        self.show_realtime = False
+        self.realtime_view = "overview"  # overview, charts
+        self.realtime_paused = False
+        
+        # Visual indicators
+        self.visual_indicators = VisualIndicators() if DATABASE_AVAILABLE else None
+        self.enhanced_visuals = DATABASE_AVAILABLE  # Only enable if modules are available
+        
+        # Performance optimization
+        self.performance_optimizer = PerformanceOptimizer() if DATABASE_AVAILABLE else None
+        self.performance_mode = DATABASE_AVAILABLE  # Only enable if modules are available
+        
+        # Initialize colors after all attributes are set
+        self.setup_colors()
         
     def setup_colors(self):
         """Initialize color pairs"""
@@ -618,6 +730,10 @@ class ClaudeTopUI:
         curses.init_pair(3, curses.COLOR_RED, curses.COLOR_BLACK)  # High CPU/Memory
         curses.init_pair(4, curses.COLOR_CYAN, curses.COLOR_BLACK)  # Header
         curses.init_pair(5, curses.COLOR_WHITE, curses.COLOR_BLUE)  # Selected
+        
+        # Setup enhanced visual indicators colors
+        if self.enhanced_visuals and self.visual_indicators:
+            self.visual_indicators.setup_enhanced_colors()
     
     def format_bytes(self, bytes_value):
         """Format bytes into human readable format"""
@@ -656,16 +772,31 @@ class ClaudeTopUI:
         self.stdscr.addstr(1, left_col, f"Processes: {stats['process_stats']['total']} total")
         self.stdscr.addstr(2, left_col, f"  Running: {stats['cpu_stats']['count_running']}  Idle: {stats['cpu_stats']['count_idle']}  Waiting: {stats['cpu_stats']['count_waiting']}")
         
-        # CPU usage bar (similar to htop)
+        # CPU usage bar with enhanced visuals
         cpu_percent = min(stats['cpu_stats']['current'], 100.0)
-        cpu_bar = self.create_usage_bar(cpu_percent, 30)
-        self.stdscr.addstr(3, left_col, f"CPU: {cpu_percent:5.1f}% {cpu_bar}")
+        if self.enhanced_visuals and self.visual_indicators:
+            cpu_bar, cpu_color, cpu_pct = self.visual_indicators.create_enhanced_progress_bar(
+                cpu_percent, 100, 30, IndicatorStyle.MODERN)
+            self.stdscr.addstr(3, left_col, f"CPU: ")
+            self.stdscr.addstr(3, left_col + 5, f"[{cpu_bar}]", curses.color_pair(cpu_color))
+            self.stdscr.addstr(3, left_col + 38, f" {cpu_pct}")
+        else:
+            cpu_bar = self.create_usage_bar(cpu_percent, 30)
+            self.stdscr.addstr(3, left_col, f"CPU: {cpu_percent:5.1f}% {cpu_bar}")
         
-        # Memory usage (show total and average)
+        # Memory usage with enhanced visuals
         mem_total = stats['memory_stats']['current']
         mem_avg = stats['memory_stats']['average']
-        mem_bar = self.create_usage_bar(min(mem_avg, 1000) / 10, 30)  # Scale for visualization
-        self.stdscr.addstr(4, left_col, f"Mem: {mem_total:7.1f}MB total {mem_bar}")
+        if self.enhanced_visuals and self.visual_indicators:
+            # Scale memory for visualization (assume 2GB as "full")
+            mem_bar, mem_color, mem_pct = self.visual_indicators.create_enhanced_progress_bar(
+                mem_avg, 2000, 30, IndicatorStyle.MODERN)
+            self.stdscr.addstr(4, left_col, f"Mem: ")
+            self.stdscr.addstr(4, left_col + 5, f"[{mem_bar}]", curses.color_pair(mem_color))
+            self.stdscr.addstr(4, left_col + 38, f" {mem_total:6.1f}MB")
+        else:
+            mem_bar = self.create_usage_bar(min(mem_avg, 1000) / 10, 30)  # Scale for visualization
+            self.stdscr.addstr(4, left_col, f"Mem: {mem_total:7.1f}MB total {mem_bar}")
         
         # Right column - Network and Disk I/O
         right_col = width // 2 + 5
@@ -691,6 +822,24 @@ class ClaudeTopUI:
         additional_stats = f"Connections: {connections} | MCP: {mcp_count} | Historical Sessions (7d): {historical_sessions}"
         if len(additional_stats) < width - 4:
             self.stdscr.addstr(5, left_col, additional_stats)
+        
+        # Display active alerts
+        if self.active_alerts and self.monitor.alerts_enabled:
+            alert_y = 6
+            self.stdscr.attron(curses.color_pair(3) | curses.A_BOLD)  # Red, bold
+            
+            if len(self.active_alerts) == 1:
+                alert = self.active_alerts[0]
+                alert_msg = f"⚠ ALERT: {alert['process']} (PID {alert['pid']}) - "
+                if alert['type'] == 'cpu':
+                    alert_msg += f"CPU: {alert['value']:.1f}% > {alert['threshold']:.0f}%"
+                else:
+                    alert_msg += f"Memory: {alert['value']:.0f}MB > {alert['threshold']:.0f}MB"
+            else:
+                alert_msg = f"⚠ {len(self.active_alerts)} RESOURCE ALERTS - Press 'A' for details"
+            
+            self.stdscr.addstr(alert_y, 2, alert_msg[:width-4])
+            self.stdscr.attroff(curses.color_pair(3) | curses.A_BOLD)
         
         # Column headers with sort indicator
         sort_indicators = {
@@ -734,8 +883,11 @@ class ClaudeTopUI:
                 else:
                     header_line += label
         
+        # Adjust header line position based on alerts
+        header_y = 8 if (self.active_alerts and self.monitor.alerts_enabled) else 7
+        
         self.stdscr.attron(curses.A_UNDERLINE)
-        self.stdscr.addstr(7, 0, header_line[:width-1])  # Moved down to line 7
+        self.stdscr.addstr(header_y, 0, header_line[:width-1])
         self.stdscr.attroff(curses.A_UNDERLINE)
         
     def apply_search_filter(self):
@@ -798,18 +950,22 @@ class ClaudeTopUI:
                 line_count += 1
     
     def draw_instance_row(self, instance, y, indent, width, is_selected):
-        """Draw a single instance row"""
-        # Color based on status
-        if instance.status == 'running':
-            color = curses.color_pair(1)  # Green
-        elif instance.status == 'waiting':
-            color = curses.color_pair(4)  # Cyan - waiting for user
-        elif instance.status == 'idle':
-            color = curses.color_pair(0)  # Default - minimal activity
-        elif instance.status == 'paused':
-            color = curses.color_pair(2)  # Yellow
+        """Draw a single instance row with enhanced visual indicators"""
+        # Get status-based color with enhanced visuals
+        if self.enhanced_visuals and self.visual_indicators:
+            color = curses.color_pair(self.visual_indicators.get_status_color(instance.status))
         else:
-            color = curses.color_pair(0)
+            # Original color scheme
+            if instance.status == 'running':
+                color = curses.color_pair(1)  # Green
+            elif instance.status == 'waiting':
+                color = curses.color_pair(4)  # Cyan - waiting for user
+            elif instance.status == 'idle':
+                color = curses.color_pair(0)  # Default - minimal activity
+            elif instance.status == 'paused':
+                color = curses.color_pair(2)  # Yellow
+            else:
+                color = curses.color_pair(0)
         
         # High resource usage warning
         if instance.cpu_percent > 80 or instance.memory_mb > 1000:
@@ -829,30 +985,59 @@ class ClaudeTopUI:
             else:
                 dir_display = instance.working_dir
         
-        # Format I/O data
-        net_out_display = self.format_bytes(instance.net_bytes_sent)
-        net_in_display = self.format_bytes(instance.net_bytes_recv)
-        net_total_display = self.format_bytes(instance.net_bytes_total)
-        disk_total_display = self.format_bytes(instance.disk_total_bytes)
-        disk_current_display = self.format_bytes(instance.disk_current_bytes)
-        
-        # Connection display
-        if instance.mcp_connections > 0:
-            conn_display = f"{instance.connections_count}M"
+        # Format I/O data with enhanced visual indicators
+        if self.enhanced_visuals and self.visual_indicators:
+            net_out_display, out_indicator = self.visual_indicators.format_bytes_with_indicator(instance.net_bytes_sent)
+            net_in_display, in_indicator = self.visual_indicators.format_bytes_with_indicator(instance.net_bytes_recv)
+            net_total_display, total_indicator = self.visual_indicators.format_bytes_with_indicator(instance.net_bytes_total)
+            disk_total_display, disk_indicator = self.visual_indicators.format_bytes_with_indicator(instance.disk_total_bytes)
+            disk_current_display, current_indicator = self.visual_indicators.format_bytes_with_indicator(instance.disk_current_bytes)
+            
+            # Add activity indicators
+            net_out_display = f"{net_out_display:>7}"
+            net_in_display = f"{net_in_display:>7}"
+            net_total_display = f"{net_total_display:>7}"
+            disk_total_display = f"{disk_total_display:>7}"
+            disk_current_display = f"{disk_current_display:>7}"
         else:
-            conn_display = f"{instance.connections_count}"
+            # Original formatting
+            net_out_display = self.format_bytes(instance.net_bytes_sent)
+            net_in_display = self.format_bytes(instance.net_bytes_recv)
+            net_total_display = self.format_bytes(instance.net_bytes_total)
+            disk_total_display = self.format_bytes(instance.disk_total_bytes)
+            disk_current_display = self.format_bytes(instance.disk_current_bytes)
         
-        # Build row
+        # Connection display with enhanced indicators
+        if self.enhanced_visuals:
+            if instance.mcp_connections > 0:
+                conn_display = f"{instance.connections_count}●"  # Dot indicates MCP
+            else:
+                conn_display = f"{instance.connections_count}○"
+        else:
+            if instance.mcp_connections > 0:
+                conn_display = f"{instance.connections_count}M"
+            else:
+                conn_display = f"{instance.connections_count}"
+        
+        # Status display with visual indicators
+        if self.enhanced_visuals and self.visual_indicators:
+            status_icon = self.visual_indicators.get_status_icon(instance.status)
+            status_display = f"{status_icon} {instance.status:>6}"
+        else:
+            status_display = f"{instance.status:>8}"
+        
+        # Build row with enhanced visuals
         spacing = " " * indent
         if self.multi_select_mode:
-            checkbox = "[×]" if instance.pid in self.selected_instances else "[ ]"
-            selection_indicator = "→" if is_selected else " "
-            row = f"{spacing}{checkbox}{selection_indicator}{instance.pid:>6} {instance.status:>8} {instance.cpu_percent:>6.1f} {instance.memory_mb:>8.1f} {net_out_display:>8} {net_in_display:>8} {net_total_display:>8} {disk_total_display:>8} {disk_current_display:>8} {conn_display:>5} {elapsed_str:>8} {dir_display}"
+            checkbox = "[✓]" if instance.pid in self.selected_instances else "[ ]"
+            selection_indicator = "▶" if is_selected and self.enhanced_visuals else "→" if is_selected else " "
+            row = f"{spacing}{checkbox}{selection_indicator}{instance.pid:>6} {status_display} {instance.cpu_percent:>6.1f} {instance.memory_mb:>8.1f} {net_out_display:>8} {net_in_display:>8} {net_total_display:>8} {disk_total_display:>8} {disk_current_display:>8} {conn_display:>5} {elapsed_str:>8} {dir_display}"
         else:
             if is_selected:
-                row = f"{spacing}→ {instance.pid:>6} {instance.status:>8} {instance.cpu_percent:>6.1f} {instance.memory_mb:>8.1f} {net_out_display:>8} {net_in_display:>8} {net_total_display:>8} {disk_total_display:>8} {disk_current_display:>8} {conn_display:>5} {elapsed_str:>8} {dir_display}"
+                selection_indicator = "▶ " if self.enhanced_visuals else "→ "
+                row = f"{spacing}{selection_indicator}{instance.pid:>6} {status_display} {instance.cpu_percent:>6.1f} {instance.memory_mb:>8.1f} {net_out_display:>8} {net_in_display:>8} {net_total_display:>8} {disk_total_display:>8} {disk_current_display:>8} {conn_display:>5} {elapsed_str:>8} {dir_display}"
             else:
-                row = f"{spacing}  {instance.pid:>6} {instance.status:>8} {instance.cpu_percent:>6.1f} {instance.memory_mb:>8.1f} {net_out_display:>8} {net_in_display:>8} {net_total_display:>8} {disk_total_display:>8} {disk_current_display:>8} {conn_display:>5} {elapsed_str:>8} {dir_display}"
+                row = f"{spacing}  {instance.pid:>6} {status_display} {instance.cpu_percent:>6.1f} {instance.memory_mb:>8.1f} {net_out_display:>8} {net_in_display:>8} {net_total_display:>8} {disk_total_display:>8} {disk_current_display:>8} {conn_display:>5} {elapsed_str:>8} {dir_display}"
         
         if is_selected:
             self.stdscr.attron(curses.color_pair(5))
@@ -867,7 +1052,8 @@ class ClaudeTopUI:
     def draw_instances(self):
         """Draw the list of Claude instances"""
         height, width = self.stdscr.getmaxyx()
-        start_y = 8  # Start after expanded header
+        # Adjust start position based on alerts
+        start_y = 9 if (self.active_alerts and self.monitor.alerts_enabled) else 8
         visible_lines = height - start_y - 3  # Leave room for footer
         
         # Use filtered instances if search is active
@@ -914,7 +1100,8 @@ class ClaudeTopUI:
         if self.multi_select_mode:
             commands = f"Space:Select  a:All  n:None  p:Pause  K:Kill  ESC:Exit  ↑↓:Navigate{db_status}"
         else:
-            commands = f"q:Quit  /:Search  m:Multi  g:Group  p:Pause  K:Kill  s:Sort  f:Path  h:Help{db_status}"
+            alert_indicator = " A:Alerts" if self.monitor.alerts_enabled else ""
+            commands = f"q:Quit  /:Search  m:Multi  g:Group  p:Pause  K:Kill  s:Sort{alert_indicator}  h:Help{db_status}"
         self.stdscr.addstr(height-1, 2, commands[:width-4])
     
     def draw_help(self):
@@ -946,6 +1133,7 @@ class ClaudeTopUI:
             "  K           - Kill selected instance (with confirmation)",
             "  f           - Toggle full/short directory path",
             "  g           - Group by project/workspace",
+            "  A           - Show/configure resource alerts",
             "",
             "Sorting:",
             "  s           - Cycle: PID→CPU→Mem→Net↑→Net↓→NetΣ→DiskΣ→Disk∆→Conn→Time",
@@ -961,7 +1149,14 @@ class ClaudeTopUI:
             "",
             "Controls:",
             "  h           - Toggle this help",
+            "  D           - Analytics dashboard (requires database)",
+            "  R           - Real-time dashboard with live charts",
+            "  V           - Toggle enhanced visual indicators",
+            "  P           - Toggle performance optimization",
+            "  I           - Show performance information",
             "  d           - Show database statistics (if enabled)",
+            "  N           - Adjust process priority (nice value)",
+            "  C           - Process cleanup (zombies/orphans)",
             "  q or Esc    - Quit",
             "",
             "Press any key to close help..."
@@ -991,6 +1186,47 @@ class ClaudeTopUI:
             # Wait for any key press to close help
             if key != -1:
                 self.show_help = False
+            return True
+        
+        # Handle analytics mode input
+        if self.show_analytics:
+            if key == ord('q') or key == 27:  # ESC or q - exit analytics
+                self.show_analytics = False
+            elif key == ord('1'):  # 1 day
+                if self.analytics_view == "overview":
+                    self.analytics_timeframe = 1
+            elif key == ord('2'):  # 7 days
+                if self.analytics_view == "overview":
+                    self.analytics_timeframe = 7
+            elif key == ord('3'):  # 30 days
+                if self.analytics_view == "overview":
+                    self.analytics_timeframe = 30
+            elif key == ord('t'):  # Trends view
+                self.analytics_view = "trends"
+            elif key == ord('p'):  # Projects view
+                self.analytics_view = "projects"
+            elif key == ord('o'):  # Overview
+                self.analytics_view = "overview"
+            elif key == ord('r'):  # Productivity view
+                self.analytics_view = "productivity"
+            elif key == ord('s'):  # Session details view
+                self.analytics_view = "sessions"
+            elif key == ord('e'):  # Export data
+                self.show_export_dialog()
+            return True
+        
+        # Handle real-time dashboard input
+        if self.show_realtime:
+            if key == ord('q') or key == 27:  # ESC or q - exit real-time
+                self.show_realtime = False
+            elif key == ord(' '):  # Space - pause/resume updates
+                self.realtime_paused = not self.realtime_paused
+            elif key == ord('o'):  # Overview
+                self.realtime_view = "overview"
+            elif key == ord('c'):  # Charts view
+                self.realtime_view = "charts"
+            elif key == ord('r'):  # Reset data
+                self.realtime_dashboard = RealTimeDashboard()
             return True
         
         # Handle search mode input
@@ -1069,8 +1305,20 @@ class ClaudeTopUI:
             self.monitor.group_by_project = not self.monitor.group_by_project
             if self.monitor.group_by_project:
                 self.monitor.group_instances_by_project()
+        elif key == ord('A'):  # Show alert details
+            if self.active_alerts:
+                self.show_alert_details()
+            else:
+                self.show_alert_configuration()
         elif key == ord('h'):
             self.show_help = True
+        elif key == ord('D'):  # Analytics dashboard
+            if self.analytics and DATABASE_AVAILABLE:
+                self.show_analytics = True
+                self.analytics_view = "overview"
+                self.analytics_timeframe = 7
+            else:
+                self.error_message = "Analytics requires database functionality"
         elif key == curses.KEY_UP or key == ord('k'):
             if self.monitor.selected_index > 0:
                 self.monitor.selected_index -= 1
@@ -1128,8 +1376,204 @@ class ClaudeTopUI:
                 self.show_database_stats()
             else:
                 self.error_message = "Database tracking not enabled"
+        elif key == ord('N'):  # Capital N for nice (priority adjustment)
+            # Adjust process priority
+            instances = self.filtered_instances if self.search_query else self.monitor.instances
+            if instances and self.monitor.selected_index < len(instances):
+                instance = instances[self.monitor.selected_index]
+                info = self.process_manager.get_process_info(instance.pid)
+                if info:
+                    new_nice = self.process_manager.show_priority_dialog(self.stdscr, instance.pid, info.nice)
+                    if new_nice is not None:
+                        success, message = self.process_manager.adjust_process_priority(instance.pid, new_nice)
+                        self.error_message = message
+                else:
+                    self.error_message = f"Cannot get info for process {instance.pid}"
+        elif key == ord('C'):  # Capital C for cleanup
+            # Show process cleanup dialog
+            self.show_process_cleanup()
+        elif key == ord('R'):  # Capital R for real-time dashboard
+            # Enter real-time dashboard mode
+            self.show_realtime = True
+            self.realtime_view = "overview"
+            self.realtime_paused = False
+        elif key == ord('V'):  # Capital V for visual toggle
+            # Toggle enhanced visuals
+            self.enhanced_visuals = not self.enhanced_visuals
+            if self.enhanced_visuals:
+                self.visual_indicators.setup_enhanced_colors()
+                self.error_message = "Enhanced visuals enabled"
+            else:
+                self.error_message = "Enhanced visuals disabled"
+        elif key == ord('P'):  # Capital P for performance toggle
+            # Toggle performance mode
+            if self.performance_optimizer:
+                self.performance_mode = not self.performance_mode
+                if self.performance_mode:
+                    self.performance_optimizer.start_background_processing()
+                    self.error_message = "Performance optimization enabled"
+                else:
+                    self.performance_optimizer.stop_background_processing()
+                    self.error_message = "Performance optimization disabled"
+            else:
+                self.error_message = "Performance optimizer not available"
+        elif key == ord('I'):  # Capital I for performance info
+            # Show performance information
+            if self.performance_mode and self.performance_optimizer:
+                summary = self.performance_optimizer.get_performance_summary()
+                self.error_message = f"Perf: {summary['frame_rate']:.1f}FPS, {summary['avg_update_time']:.1f}ms update, {summary['status']}"
+            else:
+                self.error_message = "Performance mode disabled or not available"
         
         return True
+    
+    def show_process_cleanup(self):
+        """Show process cleanup interface"""
+        action = self.process_manager.show_cleanup_dialog(self.stdscr)
+        
+        if action == "zombies":
+            results = self.process_manager.cleanup_zombie_processes()
+            if results:
+                success_count = sum(1 for _, success, _ in results if success)
+                self.error_message = f"Zombie cleanup: {success_count}/{len(results)} successful"
+            else:
+                self.error_message = "No zombie processes found"
+                
+        elif action == "orphans":
+            orphans = self.process_manager.find_orphaned_claude_processes()
+            if orphans:
+                # Show confirmation for orphaned process cleanup
+                if self.show_orphan_cleanup_confirmation(orphans):
+                    results = self.process_manager.cleanup_orphaned_processes(orphans)
+                    success_count = sum(1 for _, success, _ in results if success)
+                    self.error_message = f"Orphan cleanup: {success_count}/{len(results)} successful"
+                else:
+                    self.error_message = "Orphan cleanup cancelled"
+            else:
+                self.error_message = "No orphaned Claude processes found"
+                
+        elif action == "both":
+            # Clean zombies first
+            zombie_results = self.process_manager.cleanup_zombie_processes()
+            zombie_success = sum(1 for _, success, _ in zombie_results if success)
+            
+            # Then orphans with confirmation
+            orphans = self.process_manager.find_orphaned_claude_processes()
+            orphan_success = 0
+            if orphans and self.show_orphan_cleanup_confirmation(orphans):
+                orphan_results = self.process_manager.cleanup_orphaned_processes(orphans)
+                orphan_success = sum(1 for _, success, _ in orphan_results if success)
+            
+            self.error_message = f"Cleanup complete: {zombie_success} zombies, {orphan_success} orphans"
+            
+        elif action == "settings":
+            self.show_cleanup_settings()
+    
+    def show_orphan_cleanup_confirmation(self, orphans: List[int]) -> bool:
+        """Show confirmation dialog for orphaned process cleanup"""
+        height, width = self.stdscr.getmaxyx()
+        
+        dialog_text = [
+            "⚠️  ORPHANED PROCESS CLEANUP WARNING ⚠️",
+            "",
+            f"Found {len(orphans)} orphaned Claude processes:",
+        ]
+        
+        # Show PIDs
+        for pid in orphans[:10]:  # Show first 10
+            dialog_text.append(f"  PID {pid}")
+        
+        if len(orphans) > 10:
+            dialog_text.append(f"  ... and {len(orphans) - 10} more")
+        
+        dialog_text.extend([
+            "",
+            "⚠️  WARNING: This will terminate these processes!",
+            "⚠️  Only proceed if you're sure they're not needed.",
+            "",
+            "Y - Yes, clean up orphaned processes",
+            "N - No, cancel cleanup",
+        ])
+        
+        # Calculate dialog dimensions
+        box_height = len(dialog_text) + 4
+        box_width = max(len(line) for line in dialog_text) + 6
+        start_y = (height - box_height) // 2
+        start_x = (width - box_width) // 2
+        
+        # Draw dialog with warning colors
+        self.stdscr.attron(curses.color_pair(3))  # Red background
+        for y in range(box_height):
+            self.stdscr.addstr(start_y + y, start_x, " " * box_width)
+        
+        for i, line in enumerate(dialog_text):
+            self.stdscr.addstr(start_y + i + 2, start_x + 3, line)
+        self.stdscr.attroff(curses.color_pair(3))
+        
+        self.stdscr.refresh()
+        
+        # Wait for Y/N response
+        while True:
+            key = self.stdscr.getch()
+            if key == ord('Y') or key == ord('y'):
+                return True
+            elif key == ord('N') or key == ord('n') or key == 27:  # ESC
+                return False
+    
+    def show_cleanup_settings(self):
+        """Show cleanup settings dialog"""
+        height, width = self.stdscr.getmaxyx()
+        
+        settings_text = [
+            "Process Cleanup Settings",
+            "",
+            f"1. Auto-cleanup zombies: {'Enabled' if self.process_manager.auto_cleanup_zombies else 'Disabled'}",
+            f"2. Auto-cleanup orphans: {'Enabled' if self.process_manager.auto_cleanup_orphans else 'Disabled'}",
+            f"3. Cleanup interval: {self.process_manager.cleanup_interval}s",
+            f"4. General cleanup: {'Enabled' if self.process_manager.cleanup_enabled else 'Disabled'}",
+            "",
+            "Select option to toggle (1-4) or ESC to close",
+        ]
+        
+        # Calculate dialog dimensions
+        box_height = len(settings_text) + 4
+        box_width = max(len(line) for line in settings_text) + 6
+        start_y = (height - box_height) // 2
+        start_x = (width - box_width) // 2
+        
+        while True:
+            # Draw dialog
+            self.stdscr.attron(curses.color_pair(4))
+            for y in range(box_height):
+                self.stdscr.addstr(start_y + y, start_x, " " * box_width)
+            
+            # Update settings text
+            settings_text[2] = f"1. Auto-cleanup zombies: {'Enabled' if self.process_manager.auto_cleanup_zombies else 'Disabled'}"
+            settings_text[3] = f"2. Auto-cleanup orphans: {'Enabled' if self.process_manager.auto_cleanup_orphans else 'Disabled'}"
+            settings_text[4] = f"3. Cleanup interval: {self.process_manager.cleanup_interval}s"
+            settings_text[5] = f"4. General cleanup: {'Enabled' if self.process_manager.cleanup_enabled else 'Disabled'}"
+            
+            for i, line in enumerate(settings_text):
+                self.stdscr.addstr(start_y + i + 2, start_x + 3, line)
+            self.stdscr.attroff(curses.color_pair(4))
+            
+            self.stdscr.refresh()
+            
+            key = self.stdscr.getch()
+            
+            if key == 27:  # ESC
+                break
+            elif key == ord('1'):
+                self.process_manager.auto_cleanup_zombies = not self.process_manager.auto_cleanup_zombies
+            elif key == ord('2'):
+                self.process_manager.auto_cleanup_orphans = not self.process_manager.auto_cleanup_orphans
+            elif key == ord('3'):
+                # Cycle through interval options: 60s, 300s, 600s, 1800s
+                intervals = [60, 300, 600, 1800]
+                current_idx = intervals.index(self.process_manager.cleanup_interval) if self.process_manager.cleanup_interval in intervals else 0
+                self.process_manager.cleanup_interval = intervals[(current_idx + 1) % len(intervals)]
+            elif key == ord('4'):
+                self.process_manager.cleanup_enabled = not self.process_manager.cleanup_enabled
     
     def show_database_stats(self):
         """Show database statistics overlay"""
@@ -1344,10 +1788,361 @@ class ClaudeTopUI:
                 self.error_message = f"Killed {len(self.selected_instances)} processes forcefully"
                 return True
     
+    def show_alert_details(self):
+        """Show detailed alert information"""
+        height, width = self.stdscr.getmaxyx()
+        
+        dialog_text = [
+            "Resource Alerts",
+            "",
+            f"Active Alerts: {len(self.active_alerts)}",
+            ""
+        ]
+        
+        # Show all active alerts
+        for alert in self.active_alerts[:10]:  # Show max 10
+            if alert['type'] == 'cpu':
+                dialog_text.append(f"• PID {alert['pid']} ({alert['process']})")
+                dialog_text.append(f"  CPU: {alert['value']:.1f}% > {alert['threshold']:.0f}%")
+            else:
+                dialog_text.append(f"• PID {alert['pid']} ({alert['process']})")
+                dialog_text.append(f"  Memory: {alert['value']:.0f}MB > {alert['threshold']:.0f}MB")
+            dialog_text.append("")
+        
+        if len(self.active_alerts) > 10:
+            dialog_text.append(f"... and {len(self.active_alerts) - 10} more alerts")
+        
+        dialog_text.extend([
+            "",
+            "Alert Configuration:",
+            f"  CPU Threshold: {self.monitor.cpu_threshold:.0f}%",
+            f"  Memory Threshold: {self.monitor.memory_threshold:.0f}MB",
+            f"  Cooldown: {self.monitor.alert_cooldown}s",
+            "",
+            "Press 'C' to configure thresholds",
+            "Press any other key to close..."
+        ])
+        
+        # Calculate dialog dimensions
+        box_height = len(dialog_text) + 4
+        box_width = max(len(line) for line in dialog_text) + 6
+        start_y = (height - box_height) // 2
+        start_x = (width - box_width) // 2
+        
+        # Draw dialog box
+        self.stdscr.attron(curses.color_pair(3))  # Red color
+        for y in range(box_height):
+            self.stdscr.addstr(start_y + y, start_x, " " * box_width)
+        
+        # Draw text
+        for i, line in enumerate(dialog_text):
+            self.stdscr.addstr(start_y + i + 2, start_x + 3, line)
+        
+        self.stdscr.attroff(curses.color_pair(3))
+        self.stdscr.refresh()
+        
+        # Wait for user input
+        key = self.stdscr.getch()
+        if key == ord('c') or key == ord('C'):
+            self.show_alert_configuration()
+    
+    def show_alert_configuration(self):
+        """Show alert configuration dialog"""
+        height, width = self.stdscr.getmaxyx()
+        
+        # Store current values for editing
+        cpu_threshold = str(int(self.monitor.cpu_threshold))
+        memory_threshold = str(int(self.monitor.memory_threshold))
+        current_field = 0  # 0=CPU, 1=Memory, 2=Save, 3=Cancel
+        
+        while True:
+            dialog_text = [
+                "Configure Resource Alerts",
+                "",
+                "Use ↑/↓ to navigate, Enter to edit, numbers to change values",
+                "",
+            ]
+            
+            # CPU threshold field
+            if current_field == 0:
+                dialog_text.append(f"→ CPU Threshold: {cpu_threshold}% ")
+            else:
+                dialog_text.append(f"  CPU Threshold: {cpu_threshold}%")
+            
+            # Memory threshold field
+            if current_field == 1:
+                dialog_text.append(f"→ Memory Threshold: {memory_threshold}MB ")
+            else:
+                dialog_text.append(f"  Memory Threshold: {memory_threshold}MB")
+            
+            dialog_text.append("")
+            
+            # Save/Cancel buttons
+            if current_field == 2:
+                dialog_text.append("  [→ Save ]  [ Cancel ]")
+            elif current_field == 3:
+                dialog_text.append("  [ Save ]  [→ Cancel ]")
+            else:
+                dialog_text.append("  [ Save ]  [ Cancel ]")
+            
+            dialog_text.extend([
+                "",
+                "Press 'T' to toggle alerts on/off",
+                f"Alerts are currently: {'ENABLED' if self.monitor.alerts_enabled else 'DISABLED'}"
+            ])
+            
+            # Calculate dialog dimensions
+            box_height = len(dialog_text) + 4
+            box_width = max(len(line) for line in dialog_text) + 6
+            start_y = (height - box_height) // 2
+            start_x = (width - box_width) // 2
+            
+            # Draw dialog box
+            self.stdscr.attron(curses.color_pair(4))  # Cyan
+            for y in range(box_height):
+                self.stdscr.addstr(start_y + y, start_x, " " * box_width)
+            
+            # Draw text
+            for i, line in enumerate(dialog_text):
+                self.stdscr.addstr(start_y + i + 2, start_x + 3, line)
+            
+            self.stdscr.attroff(curses.color_pair(4))
+            self.stdscr.refresh()
+            
+            # Handle input
+            key = self.stdscr.getch()
+            
+            if key == 27:  # ESC
+                break
+            elif key == ord('t') or key == ord('T'):
+                self.monitor.alerts_enabled = not self.monitor.alerts_enabled
+            elif key == curses.KEY_UP:
+                current_field = max(0, current_field - 1)
+            elif key == curses.KEY_DOWN:
+                current_field = min(3, current_field + 1)
+            elif key == ord('\n'):  # Enter
+                if current_field == 2:  # Save
+                    try:
+                        self.monitor.cpu_threshold = float(cpu_threshold)
+                        self.monitor.memory_threshold = float(memory_threshold)
+                        self.error_message = "Alert thresholds updated"
+                    except ValueError:
+                        self.error_message = "Invalid threshold values"
+                    break
+                elif current_field == 3:  # Cancel
+                    break
+            elif key == curses.KEY_BACKSPACE or key == 127:
+                if current_field == 0 and cpu_threshold:
+                    cpu_threshold = cpu_threshold[:-1]
+                elif current_field == 1 and memory_threshold:
+                    memory_threshold = memory_threshold[:-1]
+            elif 48 <= key <= 57:  # Numbers 0-9
+                if current_field == 0:
+                    cpu_threshold += chr(key)
+                elif current_field == 1:
+                    memory_threshold += chr(key)
+    
+    def show_export_dialog(self):
+        """Show export options dialog"""
+        if not self.exporter:
+            self.error_message = "Export requires database functionality"
+            return
+        
+        height, width = self.stdscr.getmaxyx()
+        
+        # Get export stats
+        stats = self.exporter.get_export_stats()
+        
+        export_options = [
+            "Export Data - Select Format",
+            "",
+            f"Available data: {stats.get('total_sessions', 0)} sessions, {stats.get('total_projects', 0)} projects",
+            "",
+            "1. Sessions CSV (last 7 days)",
+            "2. Sessions CSV (last 30 days)", 
+            "3. Project Summary CSV",
+            "4. Detailed Metrics CSV (last 7 days)",
+            "5. Complete JSON Export (last 30 days)",
+            "",
+            "Choose option (1-5) or ESC to cancel..."
+        ]
+        
+        # Calculate dialog dimensions
+        box_height = len(export_options) + 4
+        box_width = max(len(line) for line in export_options) + 6
+        start_y = (height - box_height) // 2
+        start_x = (width - box_width) // 2
+        
+        # Draw dialog box
+        self.stdscr.attron(curses.color_pair(4))
+        for y in range(box_height):
+            self.stdscr.addstr(start_y + y, start_x, " " * box_width)
+        
+        # Draw export options
+        for i, line in enumerate(export_options):
+            self.stdscr.addstr(start_y + i + 2, start_x + 3, line)
+        self.stdscr.attroff(curses.color_pair(4))
+        
+        self.stdscr.refresh()
+        
+        # Handle export selection
+        while True:
+            key = self.stdscr.getch()
+            
+            if key == 27:  # ESC - cancel
+                break
+            elif key == ord('1'):  # Sessions CSV 7 days
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                filename = f"claude_sessions_7d_{timestamp}.csv"
+                if self.exporter.export_sessions_csv(filename, 7):
+                    self.error_message = f"Exported to {filename}"
+                else:
+                    self.error_message = "Export failed"
+                break
+            elif key == ord('2'):  # Sessions CSV 30 days
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                filename = f"claude_sessions_30d_{timestamp}.csv"
+                if self.exporter.export_sessions_csv(filename, 30):
+                    self.error_message = f"Exported to {filename}"
+                else:
+                    self.error_message = "Export failed"
+                break
+            elif key == ord('3'):  # Project summary CSV
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                filename = f"claude_projects_{timestamp}.csv"
+                if self.exporter.export_project_summary_csv(filename):
+                    self.error_message = f"Exported to {filename}"
+                else:
+                    self.error_message = "Export failed"
+                break
+            elif key == ord('4'):  # Detailed metrics CSV
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                filename = f"claude_metrics_7d_{timestamp}.csv"
+                if self.exporter.export_metrics_csv(filename, 7):
+                    self.error_message = f"Exported to {filename}"
+                else:
+                    self.error_message = "Export failed"
+                break
+            elif key == ord('5'):  # Complete JSON export
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                filename = f"claude_export_{timestamp}.json"
+                if self.exporter.export_data_json(filename, 30):
+                    self.error_message = f"Exported to {filename}"
+                else:
+                    self.error_message = "Export failed"
+                break
+    
+    def draw_analytics(self):
+        """Draw analytics dashboard"""
+        if not self.analytics:
+            height, width = self.stdscr.getmaxyx()
+            msg = "Analytics not available - database functionality required"
+            self.stdscr.addstr(height // 2, (width - len(msg)) // 2, msg)
+            return
+        
+        try:
+            if self.analytics_view == "overview":
+                data = self.analytics.get_analytics_data(getattr(self, 'analytics_timeframe', 7))
+                self.analytics.render_overview(self.stdscr, data)
+            elif self.analytics_view == "trends":
+                self.analytics.render_daily_trends(self.stdscr)
+            elif self.analytics_view == "projects":
+                self.analytics.render_project_analytics(self.stdscr)
+            elif self.analytics_view == "productivity":
+                if self.productivity:
+                    metrics = self.productivity.calculate_productivity_metrics(getattr(self, 'analytics_timeframe', 7))
+                    self.productivity.render_productivity_overview(self.stdscr, metrics)
+                else:
+                    height, width = self.stdscr.getmaxyx()
+                    msg = "Productivity analysis not available"
+                    self.stdscr.addstr(height // 2, (width - len(msg)) // 2, msg)
+            elif self.analytics_view == "sessions":
+                if self.productivity:
+                    patterns = self.productivity.analyze_session_patterns(getattr(self, 'analytics_timeframe', 7))
+                    self.productivity.render_session_patterns(self.stdscr, patterns)
+                else:
+                    height, width = self.stdscr.getmaxyx()
+                    msg = "Session analysis not available"
+                    self.stdscr.addstr(height // 2, (width - len(msg)) // 2, msg)
+        except Exception as e:
+            height, width = self.stdscr.getmaxyx()
+            error_msg = f"Analytics error: {str(e)[:width-20]}"
+            self.stdscr.addstr(height // 2, (width - len(error_msg)) // 2, error_msg)
+    
+    def draw_realtime_dashboard(self):
+        """Draw real-time dashboard"""
+        height, width = self.stdscr.getmaxyx()
+        
+        if not self.realtime_dashboard:
+            msg = "Real-time dashboard not available (missing dependencies)"
+            self.stdscr.addstr(height // 2, (width - len(msg)) // 2, msg)
+            return
+            
+        try:
+            if self.realtime_view == "overview":
+                self.realtime_dashboard.render_realtime_overview(self.stdscr, width, height)
+            elif self.realtime_view == "charts":
+                self.realtime_dashboard.render_live_charts_view(self.stdscr, width, height)
+                
+            # Show pause indicator if paused
+            if self.realtime_paused:
+                pause_msg = "⏸ PAUSED - Press Space to resume"
+                self.stdscr.addstr(1, width - len(pause_msg) - 2, pause_msg, curses.A_BOLD | curses.color_pair(2))
+                
+        except Exception as e:
+            error_msg = f"Real-time error: {str(e)[:width-20]}"
+            self.stdscr.addstr(height // 2, (width - len(error_msg)) // 2, error_msg)
+    
+    def update_realtime_metrics(self):
+        """Update real-time dashboard with current metrics"""
+        if not self.show_realtime or self.realtime_paused:
+            return
+            
+        # Calculate current metrics
+        instances = self.monitor.instances
+        
+        if instances:
+            # Aggregate metrics
+            total_cpu = sum(inst.cpu_percent for inst in instances)
+            total_memory = sum(inst.memory_mb for inst in instances)
+            active_sessions = len([inst for inst in instances if inst.status in ['running', 'waiting']])
+            
+            # Calculate network activity (sum of current activity)
+            network_activity = sum(inst.net_bytes_sent + inst.net_bytes_recv for inst in instances) / 1024  # KB
+            
+            # Calculate simple productivity score
+            if instances:
+                running_ratio = len([inst for inst in instances if inst.status == 'running']) / len(instances)
+                productivity_score = running_ratio * 100
+            else:
+                productivity_score = 0
+            
+            # Alert count
+            alert_count = len(self.active_alerts)
+            
+            # Create metrics object
+            metrics = RealTimeMetrics(
+                timestamp=datetime.now(),
+                cpu_usage=total_cpu,
+                memory_usage=total_memory,
+                active_sessions=active_sessions,
+                network_activity=network_activity,
+                productivity_score=productivity_score,
+                alert_count=alert_count
+            )
+            
+            # Add to real-time dashboard
+            if self.realtime_dashboard:
+                self.realtime_dashboard.add_metrics(metrics)
+    
     def run(self):
         """Main UI loop"""
         self.stdscr.nodelay(True)  # Non-blocking input
         curses.curs_set(0)  # Hide cursor
+        
+        # Start performance optimization
+        if self.performance_mode and self.performance_optimizer:
+            self.performance_optimizer.start_background_processing()
         
         last_update = 0
         running = True
@@ -1355,26 +2150,77 @@ class ClaudeTopUI:
         while running:
             current_time = time.time()
             
-            # Update data periodically
-            if current_time - last_update > self.monitor.update_interval:
-                self.monitor.instances = self.monitor.find_claude_processes()
-                self.monitor.sort_instances()
+            # Update data with performance optimization
+            if self.performance_mode and self.performance_optimizer:
+                update_interval = self.performance_optimizer.adaptive_update_interval
+            else:
+                update_interval = self.monitor.update_interval
+            
+            if current_time - last_update > update_interval:
                 
-                # Update grouping if enabled
-                if self.monitor.group_by_project:
-                    self.monitor.group_instances_by_project()
+                def update_data():
+                    # Core data updates (high priority)
+                    if not self.performance_optimizer or self.performance_optimizer.should_update('high'):
+                        self.monitor.instances = self.monitor.find_claude_processes()
+                        self.monitor.sort_instances()
+                    
+                    # Grouping updates (medium priority)
+                    if self.monitor.group_by_project and (not self.performance_optimizer or self.performance_optimizer.should_update('medium')):
+                        self.monitor.group_instances_by_project()
+                    
+                    # Search filter (high priority when active)
+                    if self.search_query:
+                        self.apply_search_filter()
+                    else:
+                        self.filtered_instances = self.monitor.instances
+                    
+                    # Alert checking (critical priority)
+                    if not self.performance_optimizer or self.performance_optimizer.should_update('critical'):
+                        self.active_alerts = self.monitor.check_resource_alerts()
+                    
+                    # Real-time metrics (medium priority)
+                    if self.show_realtime and (not self.performance_optimizer or self.performance_optimizer.should_update('medium')):
+                        self.update_realtime_metrics()
+                    
+                    return True
                 
-                # Apply search filter if active
-                if self.search_query:
-                    self.apply_search_filter()
+                # Measure update performance
+                if self.performance_mode and self.performance_optimizer:
+                    self.performance_optimizer.measure_update_time(update_data)
                 else:
-                    self.filtered_instances = self.monitor.instances
+                    update_data()
+                
+                # Cleanup (background priority)
+                if self.performance_optimizer.should_update('background'):
+                    def cleanup_task():
+                        cleanup_results = self.process_manager.auto_cleanup()
+                        if cleanup_results.get('actions_taken'):
+                            actions = cleanup_results['actions_taken']
+                            if actions and not self.error_message:
+                                self.error_message = f"Auto-cleanup: {'; '.join(actions[:2])}"
+                    
+                    if self.performance_mode and self.performance_optimizer:
+                        self.performance_optimizer.add_background_task(cleanup_task)
+                    else:
+                        cleanup_task()
                 
                 last_update = current_time
                 
                 # Clean up old CPU histories
                 current_pids = {inst.pid for inst in self.monitor.instances}
                 self.monitor.cpu_histories = {pid: hist for pid, hist in self.monitor.cpu_histories.items() if pid in current_pids}
+            
+            # Update animation frames for visual indicators (every refresh)
+            if self.enhanced_visuals and self.visual_indicators:
+                self.visual_indicators.update_animation_frame()
+                if self.realtime_dashboard:
+                    self.realtime_dashboard.should_animate()  # Update real-time animations
+            
+            # Update performance metrics
+            if self.performance_mode and self.monitor.instances and self.performance_optimizer:
+                total_cpu = sum(inst.cpu_percent for inst in self.monitor.instances)
+                total_memory = sum(inst.memory_mb for inst in self.monitor.instances)
+                self.performance_optimizer.update_system_metrics(total_cpu, total_memory)
                 
                 # Clean up selected instances for batch operations
                 self.selected_instances = {pid for pid in self.selected_instances if pid in current_pids}
@@ -1384,23 +2230,39 @@ class ClaudeTopUI:
                 if self.monitor.selected_index >= len(instances):
                     self.monitor.selected_index = max(0, len(instances) - 1)
             
-            # Clear and redraw
-            self.stdscr.clear()
+            # Clear and redraw with performance optimization
+            def render_ui():
+                self.stdscr.clear()
+                
+                if self.show_help:
+                    self.draw_help()
+                elif self.show_analytics:
+                    self.draw_analytics()
+                elif self.show_realtime:
+                    self.draw_realtime_dashboard()
+                else:
+                    self.draw_header()
+                    self.draw_instances()
+                    self.draw_footer()
+                
+                self.stdscr.refresh()
+                return True
             
-            if self.show_help:
-                self.draw_help()
+            # Measure rendering performance
+            if self.performance_mode:
+                self.performance_optimizer.measure_render_time(render_ui)
             else:
-                self.draw_header()
-                self.draw_instances()
-                self.draw_footer()
-            
-            self.stdscr.refresh()
+                render_ui()
             
             # Handle input
             running = self.handle_input()
             
             # Small delay to prevent high CPU usage
             time.sleep(0.05)
+        
+        # Cleanup on exit
+        if self.performance_mode:
+            self.performance_optimizer.stop_background_processing()
 
 def main(stdscr):
     """Main entry point"""
@@ -1429,10 +2291,42 @@ if __name__ == "__main__":
     parser.add_argument('--interval', type=float, default=1.0, help="Update interval in seconds")
     parser.add_argument('--no-database', action='store_true', help="Disable database tracking")
     parser.add_argument('--db-path', default="claude_tracking.db", help="Database file path")
+    parser.add_argument('--json-once', action='store_true', help="Output JSON data once and exit (for VS Code extension)")
     args = parser.parse_args()
     
     # Store args globally for access in main
     global_args = args
+    
+    # If JSON output is requested, output once and exit
+    if args.json_once:
+        monitor = ClaudeMonitor(enable_database=False)
+        instances = monitor.find_claude_processes()
+        
+        # Convert instances to JSON-serializable format
+        json_data = []
+        for inst in instances:
+            json_data.append({
+                'pid': inst.pid,
+                'working_dir': inst.working_dir,
+                'task': inst.task,
+                'context_length': inst.context_length,
+                'tokens_used': inst.tokens_used,
+                'start_time': inst.start_time.isoformat(),
+                'status': inst.status,
+                'cpu_percent': inst.cpu_percent,
+                'memory_mb': inst.memory_mb,
+                'command': inst.command,
+                'net_bytes_sent': inst.net_bytes_sent,
+                'net_bytes_recv': inst.net_bytes_recv,
+                'net_bytes_total': inst.net_bytes_total,
+                'disk_total_bytes': inst.disk_total_bytes,
+                'disk_current_bytes': inst.disk_current_bytes,
+                'connections_count': inst.connections_count,
+                'mcp_connections': inst.mcp_connections
+            })
+        
+        print(json.dumps(json_data))
+        sys.exit(0)
     
     try:
         curses.wrapper(main)
